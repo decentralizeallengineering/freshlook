@@ -1,1 +1,4 @@
 Copyright 2026 decentralizeallengineering
+
+tests/fixtures/dup_pairs contains code from Django 5.1.4, copyright Django Software Foundation and individual
+contributors, under the BSD 3-Clause license (tests/fixtures/dup_pairs/LICENSE.django).

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """freshlook: escalate a project to a fresh, independent auditor, with the goal of stopping complexity from growing.
 
-  freshlook metrics REPO [--out DIR]                        mechanical metrics (stdlib only, no tokens): writes DIR/metrics.json and DIR/metrics.md
+  freshlook metrics REPO [--out DIR] [--config-history N]   mechanical metrics (stdlib only, no tokens): writes DIR/metrics.json and DIR/metrics.md
   freshlook run REPO --intent FILE [--model M] [--out DIR]  headless `claude -p` audit in a clean config dir, read-only tools, read-only copy
                        [--dry-run] [--config-dir DIR]       --dry-run prints the exact command and calls nothing
   freshlook diff OLD_REPORT NEW_REPORT                      what got simpler and what got worse between two reports
@@ -44,7 +44,7 @@ def list_files(repo):
     out = []
     if is_git(repo):
         for p in git(repo, "ls-files", "-z").split("\0"):
-            if p and not (set(p.split("/")) & SKIP_DIRS) and os.path.isfile(os.path.join(repo, p)):
+            if p and not (set(p.split("/")[:-1]) & SKIP_DIRS) and os.path.isfile(os.path.join(repo, p)):
                 out.append(p)
     else:
         for d, dirs, files in os.walk(repo):
@@ -124,11 +124,15 @@ def parse_history(log_text):
     return dict(sorted(weeks.items()))
 
 
-def history(repo):
+def git_log(repo):
+    """One pass over history: numstat for line counts, summary for created and deleted files."""
+    return git(repo, "-c", "core.quotePath=false", "log", "--numstat", "--summary", "--format=@@%ad", "--date=short", check=False)
+
+
+def history(repo, log=None):
     if not is_git(repo):
         return {"weeks": {}, "note": "not a git repository"}
-    log = git(repo, "log", "--numstat", "--format=@@%ad", "--date=short", check=False)
-    weeks = parse_history(log)
+    weeks = parse_history(git_log(repo) if log is None else log)
     vals = list(weeks.values())
     half = len(vals) // 2
     def avg(seq, key):
@@ -136,6 +140,87 @@ def history(repo):
     return {"weeks": weeks, "avg_added_per_week_first_half": avg(vals[:half], "added"), "avg_added_per_week_second_half": avg(vals[half:], "added"),
             "avg_commits_per_week_first_half": avg(vals[:half], "commits"), "avg_commits_per_week_second_half": avg(vals[half:], "commits"),
             "net_lines": sum(v["added"] - v["deleted"] for v in vals)}
+
+
+RENAME_PART = re.compile(r"\{([^{}]*) => ([^{}]*)\}")
+SUMMARY = re.compile(r"^ (create|delete) mode \d+ (.+)$")
+ACCRETION_MIN_LINES = 50     # second-half growth below this is noise
+ACCRETION_FLAT = 1.25        # second-half commits at most this multiple of first-half commits counts as flat
+
+
+def numstat_path(p):
+    """Destination path of a numstat entry, including renames written as `a => b` or `dir/{a => b}/f`."""
+    if " => " not in p:
+        return p
+    if "{" in p:
+        return re.sub(r"/+", "/", RENAME_PART.sub(r"\2", p)).strip("/")
+    return p.split(" => ", 1)[1]
+
+
+def parse_dir_growth(log_text):
+    """Parse `git log --numstat --summary --format=@@%ad` into {top_dir: {week: {added, deleted, commits, new_files, modified_files}}}."""
+    dirs = collections.defaultdict(dict)
+    commit = None
+
+    def flush():
+        if not commit:
+            return
+        wk, stats, created, deleted = commit
+        touched = set()
+        for path, add, rem in stats:
+            d = top_dir(path)
+            w = dirs[d].setdefault(wk, {"added": 0, "deleted": 0, "commits": 0, "new_files": 0, "modified_files": 0})
+            w["added"] += add
+            w["deleted"] += rem
+            if path in created:
+                w["new_files"] += 1
+            elif path not in deleted:
+                w["modified_files"] += 1
+            if d not in touched:
+                touched.add(d)
+                w["commits"] += 1
+
+    for line in log_text.splitlines():
+        if line.startswith("@@"):
+            flush()
+            commit = (iso_week(line[2:].strip()), [], set(), set())
+        elif commit and "\t" in line:
+            parts = line.split("\t", 2)
+            if len(parts) == 3:
+                commit[1].append((numstat_path(parts[2]), int(parts[0]) if parts[0].isdigit() else 0, int(parts[1]) if parts[1].isdigit() else 0))
+        elif commit:
+            m = SUMMARY.match(line)
+            if m:
+                (commit[2] if m.group(1) == "create" else commit[3]).add(m.group(2))
+    flush()
+    return {d: dict(sorted(w.items())) for d, w in sorted(dirs.items())}
+
+
+def growth_by_dir(log_text, all_weeks):
+    """Per top-level directory: lines added and deleted per week, the new-to-modified file ratio, and an accretion flag for
+    directories whose size grows in the second half of history while their commit count stays flat or falls."""
+    half = len(all_weeks) // 2
+    first = set(all_weeks[:half])
+    out, flagged = {}, []
+    for d, weeks in parse_dir_growth(log_text).items():
+        tot = {k: sum(w[k] for w in weeks.values()) for k in ("added", "deleted", "commits", "new_files", "modified_files")}
+        halves = {}
+        for name, sel in (("first_half", lambda wk: wk in first), ("second_half", lambda wk: wk not in first)):
+            h = {k: sum(w[k] for wk, w in weeks.items() if sel(wk)) for k in ("added", "deleted", "commits")}
+            h["net"] = h["added"] - h["deleted"]
+            h["lines_per_commit"] = round(h["net"] / h["commits"], 1) if h["commits"] else 0.0
+            halves[name] = h
+        f, s = halves["first_half"], halves["second_half"]
+        accretion = (len(all_weeks) >= 4 and f["commits"] > 0 and s["net"] >= max(ACCRETION_MIN_LINES, 0.1 * max(f["net"], 0))
+                     and s["commits"] <= f["commits"] * ACCRETION_FLAT)
+        out[d] = dict(tot, net=tot["added"] - tot["deleted"],
+                      new_to_modified_ratio=round(tot["new_files"] / tot["modified_files"], 3) if tot["modified_files"] else None,
+                      accretion=accretion, weeks=weeks, **halves)
+        if accretion:
+            flagged.append({"dir": d, "net_lines_second_half": s["net"], "commits_first_half": f["commits"], "commits_second_half": s["commits"],
+                            "lines_per_commit_first_half": f["lines_per_commit"], "lines_per_commit_second_half": s["lines_per_commit"]})
+    flagged.sort(key=lambda x: -x["net_lines_second_half"])
+    return {"dirs": out, "accretion": flagged}
 
 
 def split_name(name):
@@ -151,12 +236,76 @@ def jaccard(a, b):
     return len(a & b) / len(a | b) if a and b and (a | b) else 0.0
 
 
+SHINGLE = 4         # node-type k-grams compared between two definitions
+SHAPE_THR = {"function": 0.5, "class": 0.5, "file": 0.75}   # shingle-set Jaccard needed to confirm a name/docstring candidate
+MIN_SHAPE = 30      # fewer distinct shingles (a one-liner, a wrapper, a run of near-identical declarations) is never confirmed
+GENERATED = re.compile(r"(?i)generated by|do not edit|auto-?generated|@generated")
+SOURCE_KEYWORDS = {"if", "else", "elif", "for", "while", "do", "done", "then", "fi", "case", "esac", "switch", "return", "function", "func", "fn", "def",
+                   "try", "catch", "except", "finally", "throw", "raise", "new", "class", "struct", "import", "export", "const", "let", "var", "local",
+                   "await", "async", "yield", "break", "continue", "in", "of", "echo", "exit", "match", "impl", "pub", "static", "public", "private"}
+SOURCE_TOKEN = re.compile(r"[A-Za-z_$][\w$]*|\d[\w.]*|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'|`[^`]*`|\S")
+
+
+def ast_shape(node):
+    """Node-type sequence in pre-order with identifiers and literal values dropped (a Name is just "Name", a constant just
+    "Constant"), load/store contexts and docstrings skipped, and every statement closed with ")" so nesting survives."""
+    seq, stack = [], [(node, False)]
+    while stack:   # iterative: deeply nested generated expressions must not hit the recursion limit
+        n, close = stack.pop()
+        if close:
+            seq.append(")")
+            continue
+        if isinstance(n, ast.expr_context):
+            continue
+        seq.append(type(n).__name__)
+        kids = list(ast.iter_child_nodes(n))
+        body = getattr(n, "body", None)
+        if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and body and isinstance(body[0], ast.Expr) \
+                and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+            kids = [k for k in kids if k is not body[0]]
+        if isinstance(n, ast.stmt):
+            stack.append((n, True))
+        stack.extend((k, False) for k in reversed(kids))
+    return seq
+
+
+def source_shape(text):
+    """Token-type sequence for code that has no Python AST: identifiers become I, literals L, keywords and punctuation stay."""
+    text = re.sub(r"(?m)^\s*(#|//).*$", "", text)
+    out = []
+    for t in SOURCE_TOKEN.findall(text):
+        if t[0].isalpha() or t[0] in "_$":
+            out.append(t if t in SOURCE_KEYWORDS else "I")
+        elif t[0].isdigit() or t[0] in "\"'`":
+            out.append("L")
+        else:
+            out.append(t)
+    return out
+
+
+def is_generated(rel, text):
+    """Generated code (a marker in the first lines, or a migrations directory) is duplicated by design, not by drift."""
+    return "migrations" in rel.split("/")[:-1] or GENERATED.search("\n".join(text.splitlines()[:5])) is not None
+
+
+def shingles(seq, k=SHINGLE):
+    return frozenset(tuple(seq[i:i + k]) for i in range(max(len(seq) - k + 1, 0)))
+
+
+def def_item(node, rel, lines):
+    """A Python function or class as a duplicate-finder item."""
+    seq = ast_shape(node)
+    return {"kind": "class" if isinstance(node, ast.ClassDef) else "function", "name": node.name, "file": "%s:%d" % (rel, node.lineno), "path": rel,
+            "line": node.lineno, "end": node.end_lineno, "doc": ast.get_docstring(node) or "",
+            "lines": count_lines("\n".join(lines[node.lineno - 1:node.end_lineno])), "shape_len": len(seq), "shape": shingles(seq)}
+
+
 def collect_items(repo, files):
-    """Named things that could duplicate each other: code files and Python functions or classes (with docstrings)."""
+    """Named things that could duplicate each other: code files and Python functions or classes, with docstring, size and shape."""
     items = []
     for rel in files:
         text = read_text(os.path.join(repo, rel))
-        if text is None or not is_code(rel, text) or is_test(rel):
+        if text is None or not is_code(rel, text) or is_test(rel) or is_generated(rel, text):
             continue
         stem = os.path.splitext(os.path.basename(rel))[0]
         doc = ""
@@ -167,24 +316,79 @@ def collect_items(repo, files):
                 doc = ast.get_docstring(tree) or ""
             except SyntaxError:
                 tree = None
-        items.append({"kind": "file", "name": stem, "file": rel, "doc": doc})
+        seq = ast_shape(tree) if tree else source_shape(text)
+        items.append({"kind": "file", "name": stem, "file": rel, "path": rel, "line": 1, "end": len(text.splitlines()), "doc": doc,
+                      "lines": count_lines(text), "shape_len": len(seq), "shape": shingles(seq)})
         if tree:
+            lines = text.splitlines()
             for node in ast.walk(tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     if node.name.startswith("__") or len(node.name.strip("_")) < 4 or node.name.lower() in STOP_NAMES or node.name.startswith("test"):
                         continue
-                    items.append({"kind": "function" if not isinstance(node, ast.ClassDef) else "class", "name": node.name,
-                                  "file": "%s:%d" % (rel, node.lineno), "doc": ast.get_docstring(node) or ""})
+                    items.append(def_item(node, rel, lines))
     return items
 
 
-def find_duplicates(items, name_thr=0.6, doc_thr=0.5, max_items=4000):
-    """Cluster items whose names share tokens (token Jaccard >= name_thr) or whose docstrings are similar (>= doc_thr).
+def shape_similarity(a, b):
+    """Jaccard of the two shingle sets, or 0.0 when either shape is too short to be evidence."""
+    sa, sb = a.get("shape") or frozenset(), b.get("shape") or frozenset()
+    return jaccard(sa, sb) if len(sa) >= MIN_SHAPE and len(sb) >= MIN_SHAPE else 0.0
+
+
+def nested(a, b):
+    return a.get("path") == b.get("path") and a.get("line") is not None and (a["line"] <= b["line"] <= a["end"] or b["line"] <= a["line"] <= b["end"])
+
+
+def name_candidates(items, name_thr=0.6, doc_thr=0.5, bucket_max=60):
+    """Stage 1: pairs of the same kind whose names share tokens (Jaccard >= name_thr) or whose docstrings do (>= doc_thr)."""
+    ntok = [set(split_name(i["name"])) - STOP_TOKENS for i in items]
+    dtok = [tokens(i["doc"]) if len(i["doc"].split()) >= 4 else set() for i in items]
+    index = collections.defaultdict(set)
+    for n, (nt, dt) in enumerate(zip(ntok, dtok)):
+        for t in nt:
+            index[("n", t)].add(n)
+        for t in dt:
+            index[("d", t)].add(n)
+    pairs = set()
+    for members in index.values():
+        if len(members) > bucket_max:
+            continue
+        ms = sorted(members)
+        for a in range(len(ms)):
+            for b in range(a + 1, len(ms)):
+                pairs.add((ms[a], ms[b]))
+    out = []
+    for i, j in sorted(pairs):
+        if items[i]["kind"] != items[j]["kind"]:
+            continue
+        if jaccard(ntok[i], ntok[j]) >= name_thr or jaccard(dtok[i], dtok[j]) >= doc_thr:
+            out.append((i, j))
+    return out, ntok, dtok
+
+
+def cluster_label(members, ntok, dtok):
+    """What the cluster does, in words: name tokens most members share, else shared docstring words, else the biggest member's name."""
+    def common(sets, order):
+        need = max(2, (len(sets) + 1) // 2)
+        cnt = collections.Counter(t for s in sets for t in s)
+        return [t for t in order if cnt[t] >= need]
+    first = max(members, key=lambda m: m[0]["lines"])
+    words = common([ntok[k] for _, k in members], split_name(first[0]["name"]))
+    if not words:   # shared docstring words, in the order the biggest member's docstring uses them
+        cnt = collections.Counter(t for _, k in members for t in dtok[k])
+        words = [t for t in re.findall(r"[a-z][a-z0-9]+", first[0]["doc"].lower()) if cnt[t] >= 2][:4]
+    return " ".join(dict.fromkeys(words)) or first[0]["name"]
+
+
+def find_duplicates(items, name_thr=0.6, doc_thr=0.5, max_items=4000, shape_thr=None):
+    """Duplicate mechanisms in two stages: candidates by name and docstring tokens, then confirmation by normalized AST shape
+    (shingle-set Jaccard of node-type sequences, identifiers renamed and literals dropped). Confirmed pairs are joined into
+    clusters reported as "N ways to do X" and ranked by total lines.
 
     Also flags any mechanism word (install, update, ...) that appears in the names of items in three or more files."""
     items = items[:max_items]
-    ntok = [set(split_name(i["name"])) - STOP_TOKENS for i in items]
-    dtok = [tokens(i["doc"]) if len(i["doc"].split()) >= 4 else set() for i in items]
+    shape_thr = dict(SHAPE_THR, **(shape_thr or {}))
+    cands, ntok, dtok = name_candidates(items, name_thr, doc_thr)
     parent = list(range(len(items)))
 
     def find(x):
@@ -193,42 +397,45 @@ def find_duplicates(items, name_thr=0.6, doc_thr=0.5, max_items=4000):
             x = parent[x]
         return x
 
-    index = collections.defaultdict(set)
-    for n, (nt, dt) in enumerate(zip(ntok, dtok)):
-        for t in nt:
-            index[("n", t)].add(n)
-        for t in dt:
-            index[("d", t)].add(n)
-    pairs = set()
-    for key, members in index.items():
-        if len(members) > 60:
+    sims = {}
+    for i, j in cands:
+        if nested(items[i], items[j]):
             continue
-        ms = sorted(members)
-        for a in range(len(ms)):
-            for b in range(a + 1, len(ms)):
-                pairs.add((ms[a], ms[b]))
-    for i, j in pairs:
-        if (items[i]["kind"] == "file") != (items[j]["kind"] == "file"):
-            continue
-        nj, dj = jaccard(ntok[i], ntok[j]), jaccard(dtok[i], dtok[j])
-        if nj >= name_thr or dj >= doc_thr:
+        s = shape_similarity(items[i], items[j])
+        if s >= shape_thr[items[i]["kind"]]:
+            sims[(i, j)] = s
             parent[find(i)] = find(j)
     groups = collections.defaultdict(list)
     for n in range(len(items)):
         groups[find(n)].append(n)
     clusters = []
-    for members in groups.values():
+    for root, members in groups.items():
         if len(members) < 2:
             continue
-        clusters.append({"kinds": sorted({items[m]["kind"] for m in members}), "members": [{"name": items[m]["name"], "where": items[m]["file"]} for m in members],
-                         "reason": "similar names or docstrings"})
-    clusters.sort(key=lambda c: -len(c["members"]))
+        mset = set(members)
+        edge = [s for (i, j), s in sims.items() if i in mset]
+        sim = round(sum(edge) / len(edge), 3)
+        mem = sorted(((items[m], m) for m in members), key=lambda x: (-x[0]["lines"], x[0]["file"]))
+        what = cluster_label(mem, ntok, dtok)
+        total = sum(x["lines"] for x, _ in mem)
+        clusters.append({"label": "%d ways to do %s" % (len(mem), what), "what": what, "kinds": sorted({x["kind"] for x, _ in mem}),
+                         "members": [{"name": x["name"], "where": x["file"], "file": x["path"], "line": x["line"], "end": x["end"], "lines": x["lines"]}
+                                     for x, _ in mem],
+                         "total_lines": total, "removable_lines": total - mem[0][0]["lines"], "similarity": sim,
+                         "reason": "similar names or docstrings, confirmed by AST shape similarity %.2f" % sim})
+    clusters.sort(key=lambda c: (-c["total_lines"], c["label"]))
+    kept = []
+    for c in clusters:  # a class cluster inside a file cluster (or a method cluster inside a class cluster) is the same finding
+        if not any(all(any(x["file"] == y["file"] and y["line"] <= x["line"] and x["end"] <= y["end"] for y in k["members"]) for x in c["members"])
+                   for k in kept):
+            kept.append(c)
+    clusters = kept
     mech = []
     for word in MECHANISMS:
         hits = [(i["name"], i["file"]) for i in items if word in split_name(i["name"]) or word in i["name"].lower()]
         if len({h[1].split(":")[0] for h in hits}) >= 3:
             mech.append({"mechanism": word, "count": len(hits), "where": [h[1] for h in hits][:12]})
-    return {"clusters": clusters[:40], "mechanisms": mech}
+    return {"clusters": clusters[:40], "mechanisms": mech, "candidate_pairs": len(cands), "confirmed_pairs": len(sims)}
 
 
 def py_module_names(rel):
@@ -238,8 +445,32 @@ def py_module_names(rel):
     return mod
 
 
-def dead_python_files(repo, files):
-    """Python files that no other Python file imports, excluding entry points (main guard or shebang), tests and package markers."""
+CONVENTION_DIRS = {"migrations", "commands", "templatetags", "plugins", "hooks", "fixtures", "versions"}
+CONVENTION_FILES = {"conf.py", "manage.py", "wsgi.py", "asgi.py", "noxfile.py", "fabfile.py", "tasks.py", "gunicorn.conf.py", "alembic.ini"}
+DOTTED = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
+QUOTED_WORD = re.compile(r"['\"]([A-Za-z_]\w*)['\"]")
+
+
+def dead_confidence(f, mod, mentions):
+    """How sure a dead-file candidate is dead: low when a framework loads its directory by convention or another file names it."""
+    conv = CONVENTION_DIRS & set(f.split("/")[:-1])
+    if conv:
+        return 0.1, "loaded by convention from a %s/ directory" % sorted(conv)[0]
+    if os.path.basename(f) in CONVENTION_FILES:
+        return 0.1, "a tool loads %s by name" % os.path.basename(f)
+    stem = mod.split(".")[-1]
+    named = (mentions.get(mod, set()) | (mentions.get(".".join(mod.split(".")[-2:]), set()) if mod.count(".") else set())) - {f}
+    if named:
+        return 0.3, "module path named in %s (dynamic import or registry?)" % sorted(named)[0]
+    quoted = mentions.get("'%s'" % stem, set()) - {f}
+    if quoted:
+        return 0.4, "name quoted in %s" % sorted(quoted)[0]
+    return 0.7, "no import and no textual mention found"
+
+
+def dead_python_files(repo, files, entry_modules=()):
+    """Python files that no other Python file imports, excluding entry points (main guard, shebang or console-script target),
+    tests and package markers. Each gets a confidence that it is really unused."""
     pyfiles = [f for f in files if f.endswith(".py")]
     mod_of = {f: py_module_names(f) for f in pyfiles}
     by_suffix = collections.defaultdict(set)
@@ -248,6 +479,19 @@ def dead_python_files(repo, files):
         for k in range(len(parts)):
             by_suffix[".".join(parts[k:])].add(f)
     imported, entry = set(), set()
+    for m in entry_modules:
+        entry |= by_suffix.get(m, set())
+    mentions = collections.defaultdict(set)
+    for f in files:
+        text = read_text(os.path.join(repo, f)) or ""
+        if is_test(f):
+            continue
+        for t in set(DOTTED.findall(text)):
+            parts = t.split(".")
+            for k in range(2, len(parts) + 1):
+                mentions[".".join(parts[:k])].add(f)
+        for t in set(QUOTED_WORD.findall(text)):
+            mentions["'%s'" % t].add(f)
     for f in pyfiles:
         text = read_text(os.path.join(repo, f)) or ""
         if text.startswith("#!") or re.search(r"if\s+__name__\s*==\s*['\"]__main__['\"]", text):
@@ -284,7 +528,8 @@ def dead_python_files(repo, files):
         base = os.path.basename(f)
         if f in imported or f in entry or base in ("__init__.py", "conftest.py", "setup.py", "__main__.py") or is_test(f):
             continue
-        dead.append({"file": f, "lines": count_lines(read_text(os.path.join(repo, f)) or "")})
+        conf, why = dead_confidence(f, mod_of[f], mentions)
+        dead.append({"file": f, "lines": count_lines(read_text(os.path.join(repo, f)) or ""), "confidence": conf, "why": why})
     dead.sort(key=lambda d: -d["lines"])
     return dead
 
@@ -336,11 +581,461 @@ def largest_functions(repo, files, top=10):
     return found[:top]
 
 
-def compute_metrics(repo):
+# ---------------------------------------------------------------- config surface and ways in
+
+CONF_NAME = re.compile(r"(?i)(config|conf|cfg|settings|prefs|preferences)$")
+CONF_GETS = {"get", "getint", "getfloat", "getboolean", "getbool", "getlist", "get_bool", "get_int", "get_str", "get_list"}
+CLI_CALLS = {"add_argument", "add_option", "option", "Option"}
+FLAG_CALLS = {"is_enabled", "isEnabled", "is_feature_enabled", "isFeatureEnabled", "feature_enabled", "flag_enabled", "flag_is_active", "switch_is_active",
+              "variation", "bool_variation", "boolVariation", "get_feature_flag", "getFeatureFlag"}
+FLAG_NAME = re.compile(r"(?i)^(feature|features|ff|enable|disable|experimental|flag)_\w+|^use_\w+|\w+_(enabled|disabled|flag|feature)$")
+CONFIG_HINT = re.compile(r"(?i)environ|getenv|add_argument|add_option|option\(|conf|cfg|settings|prefs|variation|enabled|is_active|feature|disable|use_|_flag|ff_")
+ENV_RES = [re.compile(r) for r in (r"process\.env\.([A-Za-z_]\w*)", r"process\.env\[\s*['\"]([^'\"]+)['\"]", r"import\.meta\.env\.([A-Za-z_]\w*)",
+                                   r"\b(?:getenv|Getenv|LookupEnv|GetEnvironmentVariable|env::var|env::var_os|env!|option_env!)\(\s*['\"]([A-Za-z_]\w*)['\"]",
+                                   r"\bENV(?:\[|\.fetch\()\s*['\"]([A-Za-z_]\w*)['\"]", r"\$_ENV\[\s*['\"]([^'\"]+)['\"]")]
+SHELL_ENV = re.compile(r"\$\{([A-Za-z_]\w*):?[-=?+]")
+SHELL_FLAG = re.compile(r"(?m)^\s*(-{1,2}[A-Za-z][\w-]*(?:\s*\|\s*-{1,2}[\w-]+)*)\s*\)")
+CLI_RES = [(re.compile(r"\.(?:option|requiredOption)\(\s*['\"]([^'\"]*-[^'\"]*)['\"]"), ""),
+           (re.compile(r"\bflag\.(?:String|Bool|Int|Int64|Uint|Uint64|Float64|Duration|Func|Var|TextVar|StringVar|BoolVar|IntVar|Int64Var|UintVar|"
+                       r"Uint64Var|Float64Var|DurationVar)\(\s*(?:&?[\w.]+\s*,\s*)?\"([\w.-]+)\""), "-"),
+           (re.compile(r"\.long\(\s*\"([\w-]+)\""), "--"), (re.compile(r"#\[arg\([^)\n]*\blong\s*=\s*\"([\w-]+)\""), "--")]
+CONF_RES = [re.compile(r) for r in (r"\b(?:config|conf|cfg|settings)\.get\(\s*['\"]([\w.:-]+)['\"]", r"\b(?:config|conf|cfg|settings)\[\s*['\"]([\w.:-]+)['\"]\s*\]",
+                                    r"\bviper\.Get\w*\(\s*\"([\w.-]+)\"")]
+FLAG_RE = re.compile(r"\b(?:%s)\(\s*['\"]([\w.:-]+)['\"]" % "|".join(sorted(FLAG_CALLS)))
+CONFIG_FILE = re.compile(r"(?i)(config|settings|defaults?)[^/]*\.(ini|cfg|conf|toml|ya?ml|json)$")
+ENV_FILE = re.compile(r"(?i)^\.?env\.(example|sample|template|dist|defaults?)$")
+TOOL_CONFIG = re.compile(r"(?i)^(ts|js)config\b|^(babel|jest|vite|webpack|eslint|tailwind|postcss)\.config\.")
+
+
+class Surface:
+    """Distinct names per category, each with every place it is read or declared."""
+    KINDS = ("env_vars", "cli_flags", "config_keys", "feature_flags")
+
+    def __init__(self):
+        self.found = {k: collections.OrderedDict() for k in self.KINDS}
+
+    def add(self, kind, name, rel, line, via=None):
+        e = self.found[kind].setdefault(name, {"name": name, "uses": 0, "where": []})
+        if via:
+            e.setdefault("via", via)
+        e["uses"] += 1
+        if len(e["where"]) < 20:
+            e["where"].append("%s:%d" % (rel, line))
+
+    def result(self):
+        for kind, via in (("env_vars", "env"), ("cli_flags", "cli"), ("config_keys", "config")):
+            for e in list(self.found[kind].values()):
+                if FLAG_NAME.match(e["name"].lstrip("-").replace("-", "_").split(".")[-1]):
+                    f = self.found["feature_flags"].setdefault(e["name"], {"name": e["name"], "uses": e["uses"], "where": list(e["where"])})
+                    f.setdefault("via", via)
+        out = {k: sorted(v.values(), key=lambda e: e["name"]) for k, v in self.found.items()}
+        counts = {k: len(v) for k, v in out.items()}
+        # flags already counted as an env var, CLI flag or config key are not counted twice
+        counts["total"] = counts["env_vars"] + counts["cli_flags"] + counts["config_keys"] + sum(1 for f in out["feature_flags"] if f.get("via") in ("call", "constant"))
+        out["counts"] = counts
+        return out
+
+
+def call_name(f):
+    return f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
+
+
+def dotted(n):
+    if isinstance(n, ast.Name):
+        return n.id
+    if isinstance(n, ast.Attribute):
+        base = dotted(n.value)
+        return base + "." + n.attr if base else ""
+    return ""
+
+
+def const_str(n):
+    return n.value if isinstance(n, ast.Constant) and isinstance(n.value, str) else None
+
+
+def conf_named(n):
+    name = n.attr if isinstance(n, ast.Attribute) else n.id if isinstance(n, ast.Name) else call_name(n.func) if isinstance(n, ast.Call) else ""
+    return bool(name) and CONF_NAME.search(name) is not None
+
+
+def conf_key(node):
+    """(dotted key, inner nodes) for config["a"]["b"], cfg.get("a"), parser.get("section", "key") and similar reads, else None."""
+    if isinstance(node, ast.Subscript):
+        key, base = const_str(node.slice), node.value
+        keys = [key] if key else None
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in CONF_GETS and node.args:
+        # get("key", default) reads one key; configparser's getint("section", "option") and friends read section.option
+        base, n = node.func.value, 1 if node.func.attr == "get" else 2
+        keys = [const_str(a) for a in node.args[:n]]
+        keys = [k for k in keys if k] if keys[0] else None
+    else:
+        return None
+    if not keys:
+        return None
+    if conf_named(base):
+        return keys, [node]
+    inner = conf_key(base)
+    return (inner[0] + keys, inner[1] + [node]) if inner else None
+
+
+def py_surface(rel, text, s):
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return
+    environ_name = any(isinstance(n, ast.ImportFrom) and n.module == "os" and any(a.name == "environ" for a in n.names) for n in ast.walk(tree))
+
+    def is_environ(n):
+        d = dotted(n)
+        return d in ("os.environ", "os.environb") or (environ_name and d == "environ")
+    consumed = set()
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", 1)
+        if id(node) in consumed:
+            continue
+        if isinstance(node, ast.Call):
+            name, first = call_name(node.func), const_str(node.args[0]) if node.args else None
+            if first and (name in ("getenv", "getenvb") or (name in ("get", "setdefault", "pop") and isinstance(node.func, ast.Attribute) and is_environ(node.func.value))):
+                s.add("env_vars", first, rel, line)
+                continue
+            if name in CLI_CALLS:
+                flags = [a for a in (const_str(x) for x in node.args) if a and a.startswith("-")]
+                if flags:
+                    s.add("cli_flags", max(flags, key=len), rel, line)
+                continue
+            if name in FLAG_CALLS and first:
+                s.add("feature_flags", first, rel, line, via="call")
+                continue
+            if name == "getattr" and len(node.args) >= 2 and conf_named(node.args[0]) and const_str(node.args[1]):
+                s.add("config_keys", const_str(node.args[1]), rel, line)
+                continue
+        if isinstance(node, ast.Subscript) and is_environ(node.value) and const_str(node.slice) and isinstance(node.ctx, ast.Load):
+            s.add("env_vars", const_str(node.slice), rel, line)
+            continue
+        if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], (ast.In, ast.NotIn)) and const_str(node.left) \
+                and is_environ(node.comparators[0]):
+            s.add("env_vars", const_str(node.left), rel, line)
+            continue
+        if isinstance(node, (ast.Subscript, ast.Call)):
+            ck = conf_key(node)
+            if ck:
+                s.add("config_keys", ".".join(ck[0]), rel, line)
+                consumed.update(id(n) for n in ck[1])
+                continue
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr.isupper() and isinstance(node.value, ast.Name) and conf_named(node.value):
+            s.add("config_keys", node.attr, rel, line)
+    for st in tree.body:
+        if isinstance(st, ast.Assign) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, bool):
+            for t in st.targets:
+                if isinstance(t, ast.Name) and t.id.isupper() and FLAG_NAME.match(t.id):
+                    s.add("feature_flags", t.id, rel, st.lineno, via="constant")
+
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
+
+
+def regex_surface(rel, text, s, shell):
+    for rx in ENV_RES + ([SHELL_ENV] if shell else []):
+        for m in rx.finditer(text):
+            s.add("env_vars", m.group(1), rel, line_of(text, m.start()))
+    for rx, prefix in CLI_RES + ([(SHELL_FLAG, "")] if shell else []):
+        for m in rx.finditer(text):
+            spec = m.group(1)
+            if prefix:
+                name = prefix + spec
+            else:
+                opts = re.findall(r"-{1,2}[A-Za-z][\w-]*", spec)
+                if not opts:
+                    continue
+                name = max(opts, key=len)
+            s.add("cli_flags", name, rel, line_of(text, m.start()))
+    for rx in CONF_RES:
+        for m in rx.finditer(text):
+            s.add("config_keys", m.group(1), rel, line_of(text, m.start()))
+    for m in FLAG_RE.finditer(text):
+        s.add("feature_flags", m.group(1), rel, line_of(text, m.start()), via="call")
+
+
+def config_file_surface(rel, text, s):
+    """Keys declared in the repository's own config files (config.yaml, settings.ini, defaults.json, .env.example and similar)."""
+    base = os.path.basename(rel)
+    if ENV_FILE.match(base):
+        for n, ln in enumerate(text.splitlines(), 1):
+            m = re.match(r"\s*(?:export\s+)?([A-Za-z_]\w*)\s*=", ln)
+            if m:
+                s.add("env_vars", m.group(1), rel, n)
+        return
+    ext = os.path.splitext(base)[1].lower()
+    if ext == ".json":
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return
+
+        def walk(obj, path):
+            if isinstance(obj, dict) and obj and len(path) < 4:
+                for k, v in obj.items():
+                    walk(v, path + [str(k)])
+            elif path:
+                pos = text.find('"%s"' % path[-1])
+                s.add("config_keys", ".".join(path), rel, line_of(text, pos) if pos >= 0 else 1)
+        walk(data, [])
+    elif ext in (".yaml", ".yml"):
+        stack = []
+        for n, ln in enumerate(text.splitlines(), 1):
+            m = re.match(r"^(\s*)([A-Za-z_][\w.-]*)\s*:(?:\s+(.*))?$", ln)
+            if not m or ln.lstrip().startswith("#"):
+                continue
+            ind, key, val = len(m.group(1)), m.group(2), (m.group(3) or "").strip()
+            while stack and stack[-1][0] >= ind:
+                stack.pop()
+            if val and not val.startswith("#"):
+                s.add("config_keys", ".".join([k for _, k in stack] + [key]), rel, n)
+            else:
+                stack.append((ind, key))
+    else:
+        section = []
+        for n, ln in enumerate(text.splitlines(), 1):
+            h = re.match(r"^\s*\[+\s*([^\]]+?)\s*\]+\s*$", ln)
+            if h:
+                section = [h.group(1).strip("\"'")]
+                continue
+            m = re.match(r"^([A-Za-z0-9_.\-]+)\s*[=:]", ln)
+            if m and not ln.lstrip().startswith(("#", ";")):
+                s.add("config_keys", ".".join(section + [m.group(1)]), rel, n)
+
+
+def is_config_file(rel):
+    base = os.path.basename(rel)
+    if ENV_FILE.match(base):
+        return True
+    return not base.startswith(".") and not TOOL_CONFIG.search(base) and CONFIG_FILE.search(base) is not None
+
+
+def config_surface(sources):
+    """Environment variables read, CLI flags, config keys and feature flags, each with its locations. sources: (relpath, text) pairs."""
+    s = Surface()
+    for rel, text in sources:
+        if text is None or is_test(rel):
+            continue
+        if is_config_file(rel):
+            config_file_surface(rel, text, s)
+        elif not is_code(rel, text):
+            continue
+        elif rel.endswith(".py") or (os.path.splitext(rel)[1] == "" and "python" in text.split("\n", 1)[0]):
+            if CONFIG_HINT.search(text):
+                py_surface(rel, text, s)
+        else:
+            ext = os.path.splitext(rel)[1].lower()
+            regex_surface(rel, text, s, ext in (".sh", ".bash") or (ext == "" and text.startswith("#!") and "sh" in text.split("\n", 1)[0]))
+    return s.result()
+
+
+def tree_sources(repo, rev):
+    """(path, text) for the code and config files of a commit, read in one `git cat-file --batch` call without a checkout."""
+    names = [p for p in git(repo, "ls-tree", "-r", "-z", "--name-only", rev).split("\0")
+             if p and "\n" not in p and not set(p.split("/")[:-1]) & SKIP_DIRS and not is_test(p)
+             and (os.path.splitext(p)[1].lower() in CODE_EXT or os.path.splitext(p)[1] == "" or is_config_file(p))]
+    out = subprocess.run(["git", "-C", repo, "cat-file", "--batch"], input="".join("%s:%s\n" % (rev, p) for p in names).encode(),
+                         capture_output=True, timeout=600).stdout
+    pos = 0
+    for p in names:
+        end = out.find(b"\n", pos)
+        if end < 0:
+            break
+        head = out[pos:end].split()
+        if len(head) < 3 or head[1] != b"blob":
+            pos = end + 1
+            continue
+        size = int(head[2])
+        data = out[end + 1:end + 1 + size]
+        pos = end + 1 + size + 1
+        if b"\0" not in data[:8000]:
+            yield p, data.decode("utf-8", "replace")
+
+
+def config_history(repo, points=6):
+    """Config surface counts at up to `points` commits spread evenly over first-parent history, oldest first."""
+    if points <= 0 or not is_git(repo):
+        return []
+    revs = [ln.split() for ln in git(repo, "log", "--first-parent", "--format=%H %ad", "--date=short", check=False).splitlines() if ln.strip()][::-1]
+    if not revs:
+        return []
+    picks = sorted({round(k * (len(revs) - 1) / max(points - 1, 1)) for k in range(points)}) if len(revs) > 1 else [0]
+    out = []
+    for k in picks:
+        sha, date = revs[k]
+        out.append(dict(commit=sha[:12], date=date, **config_surface(tree_sources(repo, sha))["counts"]))
+    return out
+
+
+ROUTE_DECORATORS = {"route", "get", "post", "put", "delete", "patch", "head", "options", "trace", "api_route", "websocket"}
+ROUTE_CALLS = {"add_url_rule", "add_api_route", "add_websocket_route"}
+WEB_FRAMEWORKS = ("flask", "fastapi")
+TIMER_KEYS = ("OnCalendar", "OnBootSec", "OnStartupSec", "OnActiveSec", "OnUnitActiveSec", "OnUnitInactiveSec")
+
+
+def route_methods(call, verb):
+    for kw in call.keywords:
+        if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple, ast.Set)):
+            ms = [const_str(e).upper() for e in kw.value.elts if const_str(e)]
+            if ms:
+                return ms
+    return ["WS"] if verb.startswith("websocket") or verb == "add_websocket_route" else ["GET"] if verb in ("route", "add_url_rule", "api_route", "add_api_route") else [verb.upper()]
+
+
+def route_path(call):
+    p = const_str(call.args[0]) if call.args else None
+    if p is None:
+        p = next((const_str(k.value) for k in call.keywords if k.arg in ("rule", "path")), None)
+    return p if p is not None and (p == "" or p.startswith("/")) else None
+
+
+def py_routes(rel, tree):
+    """Flask and FastAPI routes: @app.route / @bp.get / @router.post(...) decorators, add_url_rule and add_api_route calls."""
+    if not any(isinstance(n, (ast.Import, ast.ImportFrom)) and any(((n.module or "") if isinstance(n, ast.ImportFrom) else a.name).split(".")[0] in WEB_FRAMEWORKS
+                                                               for a in n.names) for n in ast.walk(tree)):
+        return []
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for dec in node.decorator_list:
+                if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute) and dec.func.attr in ROUTE_DECORATORS:
+                    p = route_path(dec)
+                    if p is not None:
+                        out.append({"kind": "http_route", "name": "%s %s" % ("|".join(route_methods(dec, dec.func.attr)), p or "/"),
+                                    "where": "%s:%d" % (rel, dec.lineno), "detail": node.name})
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ROUTE_CALLS:
+            p = route_path(node)
+            if p is not None:
+                out.append({"kind": "http_route", "name": "%s %s" % ("|".join(route_methods(node, node.func.attr)), p or "/"),
+                            "where": "%s:%d" % (rel, node.lineno), "detail": node.func.attr})
+    return out
+
+
+def console_scripts(rel, text):
+    """[project.scripts] / [tool.poetry.scripts] in pyproject.toml, console_scripts in setup.cfg or setup.py, "bin" in package.json."""
+    base, out = os.path.basename(rel), []
+    if base == "pyproject.toml":
+        section = ""
+        for n, ln in enumerate(text.splitlines(), 1):
+            h = re.match(r"^\s*\[([^\]]+)\]\s*$", ln)
+            if h:
+                section = h.group(1).strip()
+                continue
+            m = re.match(r"^\s*['\"]?([\w.\-]+)['\"]?\s*=\s*['\"]([\w.]+(?::[\w.]+)?)['\"]", ln)
+            if m and section in ("project.scripts", "project.gui-scripts", "tool.poetry.scripts"):
+                out.append({"kind": "console_script", "name": m.group(1), "where": "%s:%d" % (rel, n), "detail": m.group(2)})
+    elif base == "setup.cfg":
+        section, key = "", ""
+        for n, ln in enumerate(text.splitlines(), 1):
+            h = re.match(r"^\s*\[([^\]]+)\]\s*$", ln)
+            if h:
+                section, key = h.group(1).strip(), ""
+                continue
+            k = re.match(r"^(\w+)\s*=\s*(.*)$", ln)
+            if k:
+                key, ln = k.group(1), k.group(2)
+            m = re.match(r"^\s*([\w.\-]+)\s*=\s*([\w.]+(?::[\w.]+)?)\s*$", ln)
+            if m and section == "options.entry_points" and key in ("console_scripts", "gui_scripts"):
+                out.append({"kind": "console_script", "name": m.group(1), "where": "%s:%d" % (rel, n), "detail": m.group(2)})
+    elif base == "setup.py":
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return out
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                for k, v in zip(node.keys, node.values):
+                    if k is not None and const_str(k) in ("console_scripts", "gui_scripts") and isinstance(v, (ast.List, ast.Tuple)):
+                        for e in v.elts:
+                            m = re.match(r"^\s*([\w.\-]+)\s*=\s*([\w.]+(?::[\w.]+)?)\s*$", const_str(e) or "")
+                            if m:
+                                out.append({"kind": "console_script", "name": m.group(1), "where": "%s:%d" % (rel, e.lineno), "detail": m.group(2)})
+    elif base == "package.json":
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return out
+        bins = data.get("bin") if isinstance(data, dict) else None
+        if isinstance(bins, str):
+            bins = {str(data.get("name", "bin")).split("/")[-1]: bins}
+        for name, target in (bins or {}).items() if isinstance(bins, dict) else ():
+            pos = text.find('"%s"' % target)
+            out.append({"kind": "console_script", "name": name, "where": "%s:%d" % (rel, line_of(text, pos) if pos >= 0 else 1), "detail": target})
+    return out
+
+
+def systemd_timers(rel, text, units):
+    """A scheduled job per .timer unit, with its schedule and the ExecStart of the service it triggers when that unit is in the repo."""
+    sched, unit, line = [], os.path.basename(rel)[:-len(".timer")] + ".service", 1
+    for n, ln in enumerate(text.splitlines(), 1):
+        m = re.match(r"^\s*(\w+)\s*=\s*(.*?)\s*$", ln)
+        if m and m.group(1) in TIMER_KEYS:
+            sched.append("%s=%s" % m.groups())
+            line = line if len(sched) > 1 else n
+        elif m and m.group(1) == "Unit":
+            unit = m.group(2)
+    exe = re.search(r"(?m)^\s*ExecStart\s*=\s*(.+?)\s*$", units.get(unit, ""))
+    detail = ", ".join(sched) or "no schedule"
+    return {"kind": "scheduled_job", "name": os.path.basename(rel)[:-len(".timer")], "where": "%s:%d" % (rel, line),
+            "detail": detail + (" -> " + exe.group(1) if exe else " -> " + unit)}
+
+
+def entry_points(sources):
+    """Ways in: console scripts, __main__.py files and main guards, Flask/FastAPI HTTP routes, systemd timers. sources: (relpath, text) pairs."""
+    sources = [(r, t) for r, t in sources if t is not None and not is_test(r)]
+    units = {os.path.basename(r): t for r, t in sources if r.endswith(".service")}
+    items = []
+    for rel, text in sources:
+        items += console_scripts(rel, text)
+        if rel.endswith(".timer"):
+            items.append(systemd_timers(rel, text, units))
+        if not (rel.endswith(".py") or (os.path.splitext(rel)[1] == "" and "python" in text.split("\n", 1)[0])):
+            continue
+        if os.path.basename(rel) == "__main__.py":
+            items.append({"kind": "main_module", "name": "python -m %s" % (py_module_names(os.path.dirname(rel) + "/__init__.py") or "."),
+                          "where": "%s:1" % rel, "detail": "__main__.py"})
+        m = re.search(r"(?m)^if\s+__name__\s*==\s*['\"]__main__['\"]", text)
+        if m and os.path.basename(rel) != "__main__.py":
+            items.append({"kind": "main_guard", "name": rel, "where": "%s:%d" % (rel, line_of(text, m.start())), "detail": "if __name__ == '__main__'"})
+        if any(f in text for f in WEB_FRAMEWORKS):
+            try:
+                items += py_routes(rel, ast.parse(text))
+            except SyntaxError:
+                pass
+    by_kind = collections.Counter(i["kind"] for i in items)
+    return {"count": len(items), "by_kind": dict(sorted(by_kind.items())), "items": items}
+
+
+def simplification_candidates(m, top=10):
+    """Top simplification candidates, ranked by lines removable times confidence: merge a duplicate cluster down to its largest
+    member, or delete a dead file."""
+    out = []
+    for c in m["duplicates"]["clusters"]:
+        out.append({"kind": "merge_duplicates", "title": "merge %s into one" % c["label"], "where": [x["where"] for x in c["members"]],
+                    "lines_removable": c["removable_lines"], "confidence": c["similarity"]})
+    for d in m["dead_python_candidates"]:
+        out.append({"kind": "delete_dead_file", "title": "delete %s (%s)" % (d["file"], d["why"]), "where": [d["file"]],
+                    "lines_removable": d["lines"], "confidence": d["confidence"]})
+    for o in out:
+        o["score"] = round(o["lines_removable"] * o["confidence"], 1)
+    out.sort(key=lambda o: (-o["score"], o["title"]))
+    return out[:top]
+
+
+def compute_metrics(repo, config_points=6):
     repo = os.path.abspath(repo)
     files = list_files(repo)
     loc, code, tests = loc_by_dir(repo, files)
-    return {
+    log = git_log(repo) if is_git(repo) else ""
+    hist = history(repo, log)
+    surface = config_surface((rel, read_text(os.path.join(repo, rel))) for rel in files)
+    surface["history"] = config_history(repo, config_points)
+    ways_in = entry_points((rel, read_text(os.path.join(repo, rel))) for rel in files)
+    targets = [i["detail"].split(":")[0] for i in ways_in["items"] if i["kind"] == "console_script"]
+    m = {
         "repo": os.path.basename(repo),
         "generated": datetime.date.today().isoformat(),
         "files": len(files),
@@ -348,11 +1043,16 @@ def compute_metrics(repo):
         "loc_code": code,
         "loc_tests": tests,
         "test_to_code_ratio": round(tests / code, 3) if code else 0.0,
-        "history": history(repo),
+        "history": hist,
         "duplicates": find_duplicates(collect_items(repo, files)),
-        "dead_python_candidates": dead_python_files(repo, files),
+        "dead_python_candidates": dead_python_files(repo, files, targets),
         "largest_functions": largest_functions(repo, files),
+        "growth_by_dir": growth_by_dir(log, list(hist["weeks"])),
+        "config_surface": surface,
+        "entry_points": ways_in,
     }
+    m["simplification_candidates"] = simplification_candidates(m)
+    return m
 
 
 def render_summary(m, limit=8):
@@ -373,15 +1073,39 @@ def render_summary(m, limit=8):
     d = m["duplicates"]
     L += ["", "## Possible duplicate mechanisms (%d clusters)" % len(d["clusters"])]
     for c in d["clusters"][:limit]:
-        L.append("- " + ", ".join("%s (%s)" % (x["name"], x["where"]) for x in c["members"][:6]))
+        L.append("- %s (%d lines, shape similarity %.2f): %s" % (c["label"], c["total_lines"], c["similarity"],
+                                                               ", ".join("%s:%d %s" % (x["file"], x["line"], x["name"]) for x in c["members"][:6])))
     for mech in d["mechanisms"][:limit]:
         L.append("- mechanism '%s' appears %d times, e.g. %s" % (mech["mechanism"], mech["count"], ", ".join(mech["where"][:5])))
     L += ["", "## Python dead-file candidates (%d)" % len(m["dead_python_candidates"])]
     for x in m["dead_python_candidates"][:limit]:
-        L.append("- %s (%d lines)" % (x["file"], x["lines"]))
+        L.append("- %s (%d lines, confidence %.1f: %s)" % (x["file"], x["lines"], x["confidence"], x["why"]))
     L += ["", "## Largest functions"]
     for x in m["largest_functions"]:
         L.append("- %s in %s:%d, %d lines" % (x["name"], x["file"], x["line"], x["lines"]))
+    g = m["growth_by_dir"]
+    L += ["", "## Growth by top-level directory (first half -> second half of history)"]
+    for name, v in sorted(g["dirs"].items(), key=lambda kv: -kv[1]["added"])[:15]:
+        L.append("- %s: +%d -%d, net %+d then %+d lines in %d then %d commits, new/modified files %d/%d%s" % (
+            name, v["added"], v["deleted"], v["first_half"]["net"], v["second_half"]["net"], v["first_half"]["commits"], v["second_half"]["commits"],
+            v["new_files"], v["modified_files"], ", ACCRETION" if v["accretion"] else ""))
+    for a in g["accretion"]:
+        L.append("- accretion: %s grew %+d lines in the second half while commits went %d -> %d" % (
+            a["dir"], a["net_lines_second_half"], a["commits_first_half"], a["commits_second_half"]))
+    c = m["config_surface"]
+    L += ["", "## Config surface (%d)" % c["counts"]["total"]]
+    for kind in Surface.KINDS:
+        names = ", ".join("%s (%s)" % (e["name"], e["where"][0]) for e in c[kind][:limit])
+        L.append("- %s: %d%s" % (kind.replace("_", " "), c["counts"][kind], ": " + names if names else ""))
+    if len(c["history"]) > 1:
+        L.append("- over time: " + ", ".join("%s %d" % (h["date"], h["total"]) for h in c["history"]))
+    e = m["entry_points"]
+    L += ["", "## Ways in (%d)" % e["count"]]
+    for kind, n in e["by_kind"].items():
+        L.append("- %s: %d: %s" % (kind, n, ", ".join(["%s (%s)" % (i["name"], i["where"]) for i in e["items"] if i["kind"] == kind][:limit])))
+    L += ["", "## Top simplification candidates (lines removable x confidence)"]
+    for k, x in enumerate(m["simplification_candidates"], 1):
+        L.append("%d. %s: about %d lines, confidence %.2f, score %s; %s" % (k, x["title"], x["lines_removable"], x["confidence"], x["score"], ", ".join(x["where"][:4])))
     return "\n".join(L) + "\n"
 
 
@@ -440,7 +1164,7 @@ def cmd_metrics(args):
     if not os.path.isdir(args.repo):
         print("freshlook: not a directory: %s" % args.repo, file=sys.stderr)
         return 2
-    m = compute_metrics(args.repo)
+    m = compute_metrics(args.repo, args.config_history)
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(m, f, indent=2)
@@ -456,7 +1180,9 @@ def report_footer(m):
     keys = {"loc_code": m["loc_code"], "loc_tests": m["loc_tests"], "test_to_code_ratio": m["test_to_code_ratio"],
             "duplicate_clusters": len(m["duplicates"]["clusters"]), "dead_python_candidates": len(m["dead_python_candidates"]),
             "largest_function_lines": m["largest_functions"][0]["lines"] if m["largest_functions"] else 0,
-            "avg_added_per_week_second_half": h.get("avg_added_per_week_second_half", 0), "files": m["files"]}
+            "avg_added_per_week_second_half": h.get("avg_added_per_week_second_half", 0), "files": m["files"],
+            "config_surface": m["config_surface"]["counts"]["total"], "entry_points": m["entry_points"]["count"],
+            "accretion_dirs": len(m["growth_by_dir"]["accretion"])}
     return "<!-- freshlook-metrics: %s -->" % json.dumps(keys, sort_keys=True)
 
 
@@ -476,7 +1202,7 @@ def cmd_run(args):
         return 0
     with open(args.intent, encoding="utf-8") as f:
         intent = f.read()
-    m = compute_metrics(args.repo)
+    m = compute_metrics(args.repo, args.config_history)
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(m, f, indent=2)
@@ -517,7 +1243,8 @@ def cmd_run(args):
 # ---------------------------------------------------------------- diff
 
 FOOTER = re.compile(r"<!-- freshlook-metrics: (\{.*?\}) -->")
-LOWER_IS_BETTER = {"loc_code", "duplicate_clusters", "dead_python_candidates", "largest_function_lines", "avg_added_per_week_second_half", "files"}
+LOWER_IS_BETTER = {"loc_code", "duplicate_clusters", "dead_python_candidates", "largest_function_lines", "avg_added_per_week_second_half", "files",
+                   "config_surface", "entry_points", "accretion_dirs"}
 HIGHER_IS_BETTER = {"test_to_code_ratio", "loc_tests"}
 
 
@@ -601,6 +1328,7 @@ def main(argv=None):
     p = sub.add_parser("metrics", help="mechanical metrics, no tokens")
     p.add_argument("repo")
     p.add_argument("--out", default="freshlook")
+    p.add_argument("--config-history", type=int, default=6, metavar="N", help="commits sampled for config-surface growth (0: skip)")
     p.set_defaults(fn=cmd_metrics)
     p = sub.add_parser("run", help="headless audit with claude -p")
     p.add_argument("repo")
@@ -609,6 +1337,7 @@ def main(argv=None):
     p.add_argument("--out", default="freshlook")
     p.add_argument("--config-dir", default=os.environ.get("FRESHLOOK_CONFIG_DIR", ""), help="persistent clean config dir you logged in to once (default: fresh temp dir)")
     p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--config-history", type=int, default=6, metavar="N", help="commits sampled for config-surface growth (0: skip)")
     p.add_argument("--dry-run", action="store_true", help="print the exact command, call nothing")
     p.set_defaults(fn=cmd_run)
     p = sub.add_parser("diff", help="compare two reports")
