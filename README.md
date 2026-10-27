@@ -1,5 +1,7 @@
 # freshlook
 
+[![tests](https://github.com/decentralizeallengineering/freshlook/actions/workflows/tests.yml/badge.svg)](https://github.com/decentralizeallengineering/freshlook/actions/workflows/tests.yml) ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+
 Escalation to a fresh, independent auditor: a completely independent look at a project, with the emphasis on stopping complexity from growing.
 
 Why: a team that has worked on code for weeks stops seeing its own sprawl. `freshlook` first computes mechanical metrics (no tokens), then runs a headless
