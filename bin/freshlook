@@ -3,13 +3,16 @@
 
   freshlook metrics REPO [--out DIR]                        mechanical metrics (stdlib only, no tokens): writes DIR/metrics.json and DIR/metrics.md
   freshlook run REPO --intent FILE [--model M] [--out DIR]  headless `claude -p` audit in a clean config dir, read-only tools, read-only copy
+                       [--max-turns N] [--budget USD]       stop the audit after N turns or USD spent (CLI estimate)
+                       [--timeout SECONDS]                  kill the auditor after this long
                        [--dry-run] [--config-dir DIR]       --dry-run prints the exact command and calls nothing
   freshlook diff OLD_REPORT NEW_REPORT                      what got simpler and what got worse between two reports
 
 The auditor sees the code and a short intent statement only: no prior conclusions, no memory files, no instruction files, no hooks.
 Credentials are never read by this tool. See the README for how to pass an API key through the environment or log in once
-inside the clean config directory. The default output directory is ./freshlook. Exit codes: 2 usage error, 3 audit run failed."""
-import argparse, ast, collections, datetime, json, os, re, shlex, shutil, stat, subprocess, sys, tempfile
+inside the clean config directory. The default output directory is ./freshlook.
+Exit codes: 2 usage error, 3 audit run failed, 4 independence check failed, 130 interrupted."""
+import argparse, ast, collections, datetime, hashlib, io, json, os, re, shlex, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROMPT_FILE = os.environ.get("FRESHLOOK_PROMPT") or os.path.join(HERE, "prompts", "audit.md")
@@ -21,8 +24,20 @@ BRACE_EXT = {".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".c", ".h", ".cc", ".cp
 STOP_NAMES = {"main", "init", "setup", "teardown", "run", "test", "get", "set", "new", "help", "usage", "parse", "load", "save", "write", "read", "check"}
 STOP_TOKENS = {"the", "a", "an", "of", "to", "and", "or", "for", "in", "on", "is", "are", "with", "from", "that", "this", "it", "as", "by", "be", "at", "if", "py", "sh"}
 MECHANISMS = ("install", "update", "upgrade", "deploy", "release", "build", "sync", "fetch", "download", "backup", "restore", "migrate", "config", "setup", "start", "launch")
-ALLOWED_TOOLS = ["Read", "Grep", "Glob", "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)", "Bash(grep:*)", "Bash(sort:*)", "Bash(uniq:*)", "Bash(file:*)"]
-DENIED_TOOLS = ["Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task"]
+# --tools is the whole tool set; --restricted confines these to the working directory. Bash was dropped: in -p mode an
+# --allowedTools Bash pattern did not stop other commands (verified live), and Read/Grep/Glob cover what the audit needs.
+TOOLS = ["Read", "Grep", "Glob"]
+# Environment passed to the auditor: an allowlist, because the parent's CLAUDE_* variables carry its session id, plugin and
+# skill sync and extra CLAUDE.md directories into the child (verified live). Everything here is OS, network or API auth.
+PASS_ENV = {"PATH", "PATHEXT", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP",
+            "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "USER", "USERNAME", "LOGNAME", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY",
+            "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "NODE_OPTIONS", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SKIP_BEDROCK_AUTH", "CLAUDE_CODE_SKIP_VERTEX_AUTH"}
+# Cloud credentials pass only when that provider is switched on, so a machine's unrelated AWS or Google keys stay out of the auditor.
+PROVIDER_ENV = {"CLAUDE_CODE_USE_BEDROCK": ("AWS_",), "CLAUDE_CODE_USE_VERTEX": ("GOOGLE_", "CLOUD_ML_REGION", "VERTEX_REGION_")}
+# What must not be in the auditor's config directory: instructions, settings (hooks live there), user plugins, skills, agents, memory.
+FORBIDDEN_CONFIG = {"CLAUDE.md", "AGENTS.md", "settings.json", "settings.local.json", ".mcp.json", "agents", "commands", "skills", "output-styles",
+                    "hooks", "rules", "memory", "keybindings.json"}
 STRIP_NAMES = {"CLAUDE.md", "AGENTS.md", "GEMINI.md", ".claude", ".mcp.json", ".cursorrules", ".cursor", ".github", "graphify-out"}
 
 
@@ -44,12 +59,12 @@ def list_files(repo):
     out = []
     if is_git(repo):
         for p in git(repo, "ls-files", "-z").split("\0"):
-            if p and not (set(p.split("/")) & SKIP_DIRS) and os.path.isfile(os.path.join(repo, p)):
+            if p and not (set(p.split("/")[:-1]) & SKIP_DIRS) and os.path.isfile(os.path.join(repo, p)):
                 out.append(p)
     else:
         for d, dirs, files in os.walk(repo):
             dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
-            out.extend(os.path.relpath(os.path.join(d, f), repo) for f in files)
+            out.extend(os.path.relpath(os.path.join(d, f), repo).replace(os.sep, "/") for f in files)
     return sorted(out)
 
 
@@ -366,8 +381,9 @@ def render_summary(m, limit=8):
         L.append("- %s" % h.get("note", "no history"))
     else:
         L.append("- Weeks with commits: %d. Net lines: %d." % (len(h["weeks"]), h["net_lines"]))
-        L.append("- Lines added per week: %s (first half) then %s (second half)." % (h["avg_added_per_week_first_half"], h["avg_added_per_week_second_half"]))
-        L.append("- Commits per week: %s (first half) then %s (second half)." % (h["avg_commits_per_week_first_half"], h["avg_commits_per_week_second_half"]))
+        if len(h["weeks"]) >= 2:  # with one week the "first half" is empty and would read as 0
+            L.append("- Lines added per week: %s (first half) then %s (second half)." % (h["avg_added_per_week_first_half"], h["avg_added_per_week_second_half"]))
+            L.append("- Commits per week: %s (first half) then %s (second half)." % (h["avg_commits_per_week_first_half"], h["avg_commits_per_week_second_half"]))
         for wk, v in list(h["weeks"].items())[-limit:]:
             L.append("  - %s: +%d -%d in %d commits" % (wk, v["added"], v["deleted"], v["commits"]))
     d = m["duplicates"]
@@ -394,60 +410,187 @@ def assemble_prompt(intent_text, metrics_md, template=None):
     return template.replace("{{INTENT}}", intent_text.strip()).replace("{{METRICS}}", metrics_md.strip())
 
 
-def build_command(model="", claude_bin=None):
-    """The exact argument vector for the headless audit. The prompt itself is sent on standard input."""
-    cmd = [claude_bin or os.environ.get("FRESHLOOK_CLAUDE", "claude"), "-p", "--output-format", "text", "--no-session-persistence",
-           "--setting-sources", "user", "--strict-mcp-config", "--disable-slash-commands",
-           "--allowedTools", ",".join(ALLOWED_TOOLS), "--disallowedTools", ",".join(DENIED_TOOLS)]
+def build_command(model="", claude_bin=None, max_turns=0, budget=0.0):
+    """The exact argument vector for the headless audit. The prompt itself is sent on standard input.
+
+    Checked against a live claude 2.1 run: --restricted confines the file tools to the working directory and ignores user, project
+    and local settings (a planted CLAUDE.md and hooks in the config dir were not loaded), dontAsk denies whatever is not pre-approved
+    instead of prompting, and --max-turns / --max-budget-usd end the run with an error result."""
+    cmd = [claude_bin or os.environ.get("FRESHLOOK_CLAUDE", "claude"), "-p", "--output-format", "json", "--no-session-persistence",
+           "--restricted", "--safe-mode", "--permission-mode", "dontAsk", "--strict-mcp-config", "--disable-slash-commands",
+           "--tools", ",".join(TOOLS), "--allowedTools", ",".join(TOOLS)]
+    if max_turns:
+        cmd += ["--max-turns", str(max_turns)]
+    if budget:
+        cmd += ["--max-budget-usd", "%g" % budget]
     if model:
         cmd += ["--model", model]
     return cmd
 
 
+def resolve_claude(name):
+    """Absolute path of the claude executable (on Windows this finds claude.cmd or claude.exe through PATHEXT)."""
+    return shutil.which(name) or name
+
+
+def clean_env(environ, config_dir, temp_dir):
+    """The auditor's environment: allowlisted OS, network and API-auth variables, the clean config directory, and a temp directory
+    that is removed with the copy (the CLI writes its own claude-<uid> folder under TMPDIR, verified live)."""
+    prefixes = ("ANTHROPIC_",) + tuple(p for flag, ps in PROVIDER_ENV.items() if environ.get(flag) for p in ps)
+    env = {k: v for k, v in environ.items() if k.upper() in PASS_ENV or k.upper().startswith(prefixes)}
+    env.update(CLAUDE_CONFIG_DIR=config_dir, DISABLE_TELEMETRY="1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", TMPDIR=temp_dir, TMP=temp_dir,
+               TEMP=temp_dir)
+    return env
+
+
+def config_problems(cfg, environ=None):
+    """Why cfg is not a clean auditor config directory: it is the user's real one, or it holds instructions, settings (hooks),
+    user plugins, skills, agents or memory. An empty list means clean. A login (.credentials.json, .claude.json) is allowed."""
+    environ = os.environ if environ is None else environ
+    real = {os.path.realpath(os.path.join(os.path.expanduser("~"), ".claude"))}
+    if environ.get("CLAUDE_CONFIG_DIR"):
+        real.add(os.path.realpath(environ["CLAUDE_CONFIG_DIR"]))
+    if os.path.realpath(cfg) in real:
+        return ["%s is your real Claude config directory" % cfg]
+    out = ["%s (%s)" % (os.path.join(cfg, n), "instructions or settings") for n in sorted(os.listdir(cfg)) if n in FORBIDDEN_CONFIG]
+    plugins = os.path.join(cfg, "plugins")
+    if os.path.isdir(plugins):  # claude itself writes plugins/store for its built-in plugins
+        out += ["%s (user plugin)" % os.path.join(plugins, n) for n in sorted(os.listdir(plugins)) if n != "store" and not n.startswith(".")]
+    projects = os.path.join(cfg, "projects")
+    for d, _, fs in os.walk(projects):
+        if fs and "memory" in os.path.relpath(d, projects).split(os.sep):
+            out.append("%s (memory)" % d)
+    return out
+
+
 def make_readonly_copy(repo, dest):
-    """Export the committed tree (or a plain copy when not a git repository), drop instruction and hook files, then make it read-only."""
+    """Export the committed tree (or a plain copy when not a git repository), drop instruction and hook files and every symlink
+    (a link could point at the user's config), then make it read-only."""
     os.makedirs(dest)
     if is_git(repo):
-        arc = subprocess.run(["git", "-C", repo, "archive", "HEAD"], capture_output=True, timeout=300)
+        arc = subprocess.run(["git", "-C", repo, "archive", "--format=tar", "HEAD"], capture_output=True, timeout=300)
         if arc.returncode:
             raise RuntimeError("git archive failed: " + arc.stderr.decode("utf-8", "replace"))
-        subprocess.run(["tar", "-x", "-C", dest], input=arc.stdout, check=True, timeout=300)
+        with tarfile.open(fileobj=io.BytesIO(arc.stdout)) as tf:
+            members = [x for x in tf.getmembers() if not (x.issym() or x.islnk())]
+            tf.extractall(dest, members, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
     else:
-        shutil.copytree(repo, dest, dirs_exist_ok=True, ignore=shutil.ignore_patterns(*SKIP_DIRS))
-    for d, dirs, fs in os.walk(dest, topdown=True):
+        shutil.copytree(repo, dest, symlinks=True, dirs_exist_ok=True,
+                        ignore=lambda d, names: [n for n in names if n in SKIP_DIRS and os.path.isdir(os.path.join(d, n))])
+    for d, dirs, fs in os.walk(dest):
         for name in list(dirs) + list(fs):
-            if name in STRIP_NAMES:
-                p = os.path.join(d, name)
+            p = os.path.join(d, name)
+            if name in STRIP_NAMES or os.path.islink(p):
                 shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
                 if name in dirs:
                     dirs.remove(name)
-    for d, dirs, fs in os.walk(dest):
-        for name in fs:
-            p = os.path.join(d, name)
-            if not os.path.islink(p):
-                os.chmod(p, stat.S_IMODE(os.stat(p).st_mode) & ~0o222)
-    for d, dirs, fs in os.walk(dest, topdown=False):
-        os.chmod(d, 0o555)
+    set_writable(dest, False)
+
+
+def set_writable(root, writable):
+    """Add owner rwx to, or remove every write bit from, each file and directory under root. Failures are left for the caller's
+    check (writable_paths before the run, os.path.exists after removal)."""
+    for d, dirs, fs in os.walk(root):  # os.walk lists d before yielding it, so d can lose its write bit before its children are visited
+        for p in [d] + [os.path.join(d, f) for f in fs]:
+            try:
+                st = os.lstat(p)
+                if not stat.S_ISLNK(st.st_mode):
+                    os.chmod(p, stat.S_IMODE(st.st_mode) | 0o700 if writable else stat.S_IMODE(st.st_mode) & ~0o222)
+            except OSError:
+                pass
+
+
+def writable_paths(root):
+    """Paths under root that still have a write bit (empty for a read-only copy). Windows keeps no read-only bit on directories."""
+    out = []
+    for d, dirs, fs in os.walk(root):
+        for p in ([] if os.name == "nt" else [d]) + [os.path.join(d, f) for f in fs]:
+            if stat.S_IMODE(os.lstat(p).st_mode) & 0o222:
+                out.append(p)
+    return out
+
+
+def tree_digest(root):
+    """Hash of every path and file content under root. Permission bits do not stop root or an admin, so the copy is also checked for
+    being unchanged after the audit."""
+    h = hashlib.sha256()
+    for d, dirs, fs in os.walk(root):
+        dirs.sort()
+        h.update(("d:%s\0" % os.path.relpath(d, root)).encode("utf-8"))
+        for f in sorted(fs):
+            p = os.path.join(d, f)
+            h.update(("f:%s\0" % os.path.relpath(p, root)).encode("utf-8"))
+            with open(p, "rb") as fh:
+                h.update(hashlib.sha256(fh.read()).digest())
+    return h.hexdigest()
 
 
 def remove_tree(path):
-    for d, dirs, fs in os.walk(path):
-        os.chmod(d, 0o755)
+    """Delete a tree made read-only by make_readonly_copy (Windows refuses to delete read-only files). True when it is gone."""
+    set_writable(path, True)
     shutil.rmtree(path, ignore_errors=True)
+    return not os.path.exists(path)
+
+
+def kill_tree(proc):
+    """Kill proc and everything it started (claude is a node process that may itself be started by a .cmd shim on Windows)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=30)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+        proc.wait(timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def run_child(cmd, stdin_bytes, cwd, env, timeout):
+    """Run cmd in its own process group and return (exit code, stdout, stderr). On timeout, Ctrl-C or any other exception the whole
+    process tree is killed before the exception propagates, so no auditor outlives freshlook."""
+    group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env, **group)
+    try:
+        out, err = proc.communicate(stdin_bytes, timeout=timeout)
+    except BaseException:
+        kill_tree(proc)
+        raise
+    return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
+def parse_result(returncode, stdout, stderr):
+    """(result, None) from the JSON that `claude -p --output-format json` prints, or (None, reason) when the audit failed."""
+    try:
+        r = json.loads(stdout)
+    except ValueError:
+        r = None
+    if not isinstance(r, dict):
+        return None, "claude failed (exit %d): %s" % (returncode, (stderr or stdout).strip()[:800])
+    if returncode or r.get("is_error") or not str(r.get("result") or "").strip():
+        why = "; ".join(r.get("errors") or []) or str(r.get("result") or "").strip()[:800] or "empty result"
+        return None, "claude failed (exit %d, %s): %s" % (returncode, r.get("subtype", "unknown"), why)
+    return r, None
+
+
+def write_metrics(m, out):
+    """Write out/metrics.json and out/metrics.md; return the markdown summary."""
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(m, f, indent=2)
+    md = render_summary(m)
+    with open(os.path.join(out, "metrics.md"), "w", encoding="utf-8") as f:
+        f.write(md)
+    return md
 
 
 def cmd_metrics(args):
     if not os.path.isdir(args.repo):
         print("freshlook: not a directory: %s" % args.repo, file=sys.stderr)
         return 2
-    m = compute_metrics(args.repo)
-    os.makedirs(args.out, exist_ok=True)
-    with open(os.path.join(args.out, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(m, f, indent=2)
-    md = render_summary(m)
-    with open(os.path.join(args.out, "metrics.md"), "w", encoding="utf-8") as f:
-        f.write(md)
-    print(md)
+    print(write_metrics(compute_metrics(args.repo), args.out))
     return 0
 
 
@@ -460,6 +603,24 @@ def report_footer(m):
     return "<!-- freshlook-metrics: %s -->" % json.dumps(keys, sort_keys=True)
 
 
+def report_header(m, r, args, wall, env):
+    """Who audited and what it cost: the models the CLI reports, turns, wall time, tokens and the independence checks that passed."""
+    u = r.get("usage") or {}
+    denied = [x.get("tool_name", "?") for x in r.get("permission_denials") or []]
+    return "\n".join([
+        "# freshlook report: %s" % m["repo"], "",
+        "Date: %s. Model: %s (requested: %s)." % (m["generated"], ", ".join(sorted(r.get("modelUsage") or {})) or "not reported", args.model or "CLI default"),
+        "Turns: %s (limit %s). Wall time: %.0f s (limit %d s). Cost: $%.4f, the CLI's list-price estimate (budget %s)." %
+        (r.get("num_turns", "?"), args.max_turns or "none", wall, args.timeout, r.get("total_cost_usd") or 0, "$%.2f" % args.budget if args.budget else "none"),
+        "Tokens: %d input, %d output, %d cache read, %d cache write. Denied tool calls: %d%s." %
+        (tuple(u.get(k) or 0 for k in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")) +
+         (len(denied), " (%s)" % ", ".join(denied) if denied else "")),
+        "Independence: %s config directory with no CLAUDE.md, settings, hooks, user plugins, skills or memory before and after the run; "
+        "environment limited to %s; "
+        "tools %s confined to a read-only copy of the committed tree, unchanged after the audit." %
+        ("persistent" if args.config_dir else "fresh empty", ", ".join(sorted(env)), ", ".join(TOOLS)), "", ""])
+
+
 def cmd_run(args):
     if not os.path.isdir(args.repo):
         print("freshlook: not a directory: %s" % args.repo, file=sys.stderr)
@@ -467,49 +628,68 @@ def cmd_run(args):
     if not os.path.isfile(args.intent):
         print("freshlook: intent file not found: %s" % args.intent, file=sys.stderr)
         return 2
-    cmd = build_command(args.model)
+    if args.max_turns < 0 or args.budget < 0 or args.timeout < 1:
+        print("freshlook: --max-turns and --budget must be 0 (no limit) or more, --timeout at least 1", file=sys.stderr)
+        return 2
+    cmd = build_command(args.model, max_turns=args.max_turns, budget=args.budget)
     if args.dry_run:
         print("cwd: <read-only copy of %s, exported to a temp directory>" % os.path.abspath(args.repo))
-        print("env: CLAUDE_CONFIG_DIR=%s" % (os.path.abspath(args.config_dir) if args.config_dir else "<fresh empty temp directory>"))
+        print("env: CLAUDE_CONFIG_DIR=%s, other variables limited to OS, proxy and API-auth names" %
+              (os.path.abspath(args.config_dir) if args.config_dir else "<fresh empty temp directory>"))
         print("stdin: <audit prompt from %s with the intent file and metrics summary filled in>" % PROMPT_FILE)
         print("command: " + " ".join(shlex.quote(c) for c in cmd))
         return 0
+    if args.config_dir:
+        problems = config_problems(os.path.abspath(args.config_dir)) if os.path.isdir(args.config_dir) else ["%s is not a directory" % args.config_dir]
+        if problems:
+            print("freshlook: config dir is not clean, refusing to run:\n  " + "\n  ".join(problems), file=sys.stderr)
+            return 4
     with open(args.intent, encoding="utf-8") as f:
         intent = f.read()
     m = compute_metrics(args.repo)
-    os.makedirs(args.out, exist_ok=True)
-    with open(os.path.join(args.out, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(m, f, indent=2)
-    md = render_summary(m)
-    with open(os.path.join(args.out, "metrics.md"), "w", encoding="utf-8") as f:
-        f.write(md)
-    prompt = assemble_prompt(intent, md)
+    prompt = assemble_prompt(intent, write_metrics(m, args.out))
+    cmd[0] = resolve_claude(cmd[0])
     work = tempfile.mkdtemp(prefix="freshlook-")
     try:
         src = os.path.join(work, "src")
         make_readonly_copy(os.path.abspath(args.repo), src)
         cfg = os.path.abspath(args.config_dir) if args.config_dir else os.path.join(work, "claude-config")
         os.makedirs(cfg, exist_ok=True)
-        env = dict(os.environ)
-        env["CLAUDE_CONFIG_DIR"] = cfg
-        env["DISABLE_TELEMETRY"] = "1"
+        problems = config_problems(cfg) + ["%s is writable" % p for p in writable_paths(src)[:10]]
+        if problems:
+            print("freshlook: independence check failed, refusing to run:\n  " + "\n  ".join(problems), file=sys.stderr)
+            return 4
+        before = tree_digest(src)
+        env = clean_env(os.environ, cfg, os.path.join(work, "tmp"))
+        os.makedirs(env["TMPDIR"])
+        start = time.monotonic()
         try:
-            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=src, env=env, timeout=args.timeout)
+            code, out, err = run_child(cmd, prompt.encode("utf-8"), src, env, args.timeout)
         except FileNotFoundError:
             print("freshlook: claude executable not found (set FRESHLOOK_CLAUDE)", file=sys.stderr)
             return 3
         except subprocess.TimeoutExpired:
             print("freshlook: audit timed out after %ds" % args.timeout, file=sys.stderr)
             return 3
-        if r.returncode or not r.stdout.strip():
-            print("freshlook: claude failed (exit %d): %s" % (r.returncode, (r.stderr or r.stdout).strip()[:800]), file=sys.stderr)
+        wall = time.monotonic() - start
+        if tree_digest(src) != before:
+            print("freshlook: the auditor changed its read-only copy; report discarded", file=sys.stderr)
+            return 4
+        problems = config_problems(cfg)  # catches anything the CLI itself synced in during the run (plugins, skills, memory)
+        if problems:
+            print("freshlook: the auditor's config dir gained user configuration during the run; report discarded:\n  " + "\n  ".join(problems),
+                  file=sys.stderr)
+            return 4
+        r, problem = parse_result(code, out, err)
+        if problem:
+            print("freshlook: " + problem, file=sys.stderr)
             return 3
     finally:
-        remove_tree(work)
+        if not remove_tree(work):
+            print("freshlook: could not remove temp directory %s" % work, file=sys.stderr)
     path = os.path.join(args.out, "report-%s.md" % datetime.date.today().isoformat())
-    head = "# freshlook report: %s\n\nDate: %s. Model: %s.\n\n" % (m["repo"], m["generated"], args.model or "default")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(head + r.stdout.strip() + "\n\n" + report_footer(m) + "\n")
+        f.write(report_header(m, r, args, wall, env) + r["result"].strip() + "\n\n" + report_footer(m) + "\n")
     print(path)
     return 0
 
@@ -608,7 +788,9 @@ def main(argv=None):
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--out", default="freshlook")
     p.add_argument("--config-dir", default=os.environ.get("FRESHLOOK_CONFIG_DIR", ""), help="persistent clean config dir you logged in to once (default: fresh temp dir)")
-    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--timeout", type=int, default=1800, help="seconds before the auditor is killed (default 1800)")
+    p.add_argument("--max-turns", type=int, default=100, help="stop the auditor after N turns, 0 for no limit (default 100)")
+    p.add_argument("--budget", type=float, default=5.0, help="stop the auditor after this many USD by the CLI's estimate, 0 for no limit (default 5)")
     p.add_argument("--dry-run", action="store_true", help="print the exact command, call nothing")
     p.set_defaults(fn=cmd_run)
     p = sub.add_parser("diff", help="compare two reports")
@@ -616,8 +798,19 @@ def main(argv=None):
     p.add_argument("new")
     p.set_defaults(fn=cmd_diff)
     args = ap.parse_args(argv)
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except KeyboardInterrupt:
+        print("freshlook: interrupted", file=sys.stderr)
+        return 130
+
+
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
 
 
 if __name__ == "__main__":
+    for name in ("SIGTERM", "SIGHUP"):  # turn kill and hangup into Ctrl-C so the auditor and temp files are cleaned up
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _interrupt)
     sys.exit(main())
