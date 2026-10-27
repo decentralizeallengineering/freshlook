@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""freshlook: escalate a project to a fresh, independent auditor, with the goal of stopping complexity from growing.
+
+  freshlook metrics REPO [--out DIR]                        mechanical metrics (stdlib only, no tokens): writes DIR/metrics.json and DIR/metrics.md
+  freshlook run REPO --intent FILE [--model M] [--out DIR]  headless `claude -p` audit in a clean config dir, read-only tools, read-only copy
+                       [--dry-run] [--config-dir DIR]       --dry-run prints the exact command and calls nothing
+  freshlook diff OLD_REPORT NEW_REPORT                      what got simpler and what got worse between two reports
+
+The auditor sees the code and a short intent statement only: no prior conclusions, no memory files, no instruction files, no hooks.
+Credentials are never read by this tool. See the README for how to pass an API key through the environment or log in once
+inside the clean config directory. The default output directory is ./freshlook. Exit codes: 2 usage error, 3 audit run failed."""
+import argparse, ast, collections, datetime, json, os, re, shlex, shutil, stat, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROMPT_FILE = os.environ.get("FRESHLOOK_PROMPT") or os.path.join(HERE, "prompts", "audit.md")
+DEFAULT_MODEL = os.environ.get("FRESHLOOK_MODEL", "")
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache", ".ruff_cache", ".pytest_cache", "dist", "build", "freshlook"}
+CODE_EXT = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".hpp", ".java", ".kt", ".rb", ".php", ".sh", ".bash",
+            ".cs", ".swift", ".lua", ".pl", ".ps1"}
+BRACE_EXT = {".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".hpp", ".java", ".kt", ".php", ".cs", ".swift"}
+STOP_NAMES = {"main", "init", "setup", "teardown", "run", "test", "get", "set", "new", "help", "usage", "parse", "load", "save", "write", "read", "check"}
+STOP_TOKENS = {"the", "a", "an", "of", "to", "and", "or", "for", "in", "on", "is", "are", "with", "from", "that", "this", "it", "as", "by", "be", "at", "if", "py", "sh"}
+MECHANISMS = ("install", "update", "upgrade", "deploy", "release", "build", "sync", "fetch", "download", "backup", "restore", "migrate", "config", "setup", "start", "launch")
+ALLOWED_TOOLS = ["Read", "Grep", "Glob", "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)", "Bash(grep:*)", "Bash(sort:*)", "Bash(uniq:*)", "Bash(file:*)"]
+DENIED_TOOLS = ["Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task"]
+STRIP_NAMES = {"CLAUDE.md", "AGENTS.md", "GEMINI.md", ".claude", ".mcp.json", ".cursorrules", ".cursor", ".github", "graphify-out"}
+
+
+# ---------------------------------------------------------------- file discovery
+
+def git(repo, *args, check=True):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=120)
+    if check and r.returncode:
+        raise RuntimeError("git %s failed: %s" % (" ".join(args), r.stderr.strip()))
+    return r.stdout
+
+
+def is_git(repo):
+    return subprocess.run(["git", "-C", repo, "rev-parse", "--git-dir"], capture_output=True, timeout=30).returncode == 0
+
+
+def list_files(repo):
+    """Relative paths of tracked files (or all files outside skipped directories when not a git repository)."""
+    out = []
+    if is_git(repo):
+        for p in git(repo, "ls-files", "-z").split("\0"):
+            if p and not (set(p.split("/")) & SKIP_DIRS) and os.path.isfile(os.path.join(repo, p)):
+                out.append(p)
+    else:
+        for d, dirs, files in os.walk(repo):
+            dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
+            out.extend(os.path.relpath(os.path.join(d, f), repo) for f in files)
+    return sorted(out)
+
+
+def read_text(path):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(2_000_000)
+    except OSError:
+        return None
+    return None if b"\0" in raw else raw.decode("utf-8", "replace")
+
+
+def is_code(rel, text=None):
+    ext = os.path.splitext(rel)[1].lower()
+    if ext in CODE_EXT:
+        return True
+    return ext == "" and text is not None and text.startswith("#!")
+
+
+def is_test(rel):
+    parts = rel.lower().split("/")
+    base = parts[-1]
+    return bool(set(parts[:-1]) & {"tests", "test", "__tests__", "spec"}) or base.startswith("test_") or re.search(r"(_test|\.test|\.spec)\.\w+$", base) is not None
+
+
+def top_dir(rel):
+    return rel.split("/")[0] if "/" in rel else "."
+
+
+def count_lines(text):
+    return len([ln for ln in text.splitlines() if ln.strip()])
+
+
+# ---------------------------------------------------------------- metrics
+
+def loc_by_dir(repo, files):
+    out, tests = collections.Counter(), 0
+    code = 0
+    for rel in files:
+        text = read_text(os.path.join(repo, rel))
+        if text is None or not is_code(rel, text):
+            continue
+        n = count_lines(text)
+        out[top_dir(rel)] += n
+        if is_test(rel):
+            tests += n
+        else:
+            code += n
+    return dict(sorted(out.items(), key=lambda kv: -kv[1])), code, tests
+
+
+def iso_week(date_str):
+    d = datetime.date.fromisoformat(date_str)
+    y, w, _ = d.isocalendar()
+    return "%d-W%02d" % (y, w)
+
+
+def parse_history(log_text):
+    """Parse `git log --numstat --format=@@%ad --date=short` into {week: {commits, added, deleted}}."""
+    weeks = collections.OrderedDict()
+    cur = None
+    for line in log_text.splitlines():
+        if line.startswith("@@"):
+            cur = iso_week(line[2:].strip())
+            w = weeks.setdefault(cur, {"commits": 0, "added": 0, "deleted": 0})
+            w["commits"] += 1
+        elif line.strip() and cur:
+            parts = line.split("\t")
+            if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+                weeks[cur]["added"] += int(parts[0])
+                weeks[cur]["deleted"] += int(parts[1])
+    return dict(sorted(weeks.items()))
+
+
+def history(repo):
+    if not is_git(repo):
+        return {"weeks": {}, "note": "not a git repository"}
+    log = git(repo, "log", "--numstat", "--format=@@%ad", "--date=short", check=False)
+    weeks = parse_history(log)
+    vals = list(weeks.values())
+    half = len(vals) // 2
+    def avg(seq, key):
+        return round(sum(v[key] for v in seq) / len(seq), 1) if seq else 0.0
+    return {"weeks": weeks, "avg_added_per_week_first_half": avg(vals[:half], "added"), "avg_added_per_week_second_half": avg(vals[half:], "added"),
+            "avg_commits_per_week_first_half": avg(vals[:half], "commits"), "avg_commits_per_week_second_half": avg(vals[half:], "commits"),
+            "net_lines": sum(v["added"] - v["deleted"] for v in vals)}
+
+
+def split_name(name):
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    return [t[:-1] if len(t) > 3 and t.endswith("s") and not t.endswith("ss") else t for t in re.split(r"[^A-Za-z0-9]+", name.lower()) if t]
+
+
+def tokens(text):
+    return {t for t in re.findall(r"[a-z][a-z0-9]+", text.lower()) if t not in STOP_TOKENS and len(t) > 2}
+
+
+def jaccard(a, b):
+    return len(a & b) / len(a | b) if a and b and (a | b) else 0.0
+
+
+def collect_items(repo, files):
+    """Named things that could duplicate each other: code files and Python functions or classes (with docstrings)."""
+    items = []
+    for rel in files:
+        text = read_text(os.path.join(repo, rel))
+        if text is None or not is_code(rel, text) or is_test(rel):
+            continue
+        stem = os.path.splitext(os.path.basename(rel))[0]
+        doc = ""
+        tree = None
+        if rel.endswith(".py"):
+            try:
+                tree = ast.parse(text)
+                doc = ast.get_docstring(tree) or ""
+            except SyntaxError:
+                tree = None
+        items.append({"kind": "file", "name": stem, "file": rel, "doc": doc})
+        if tree:
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if node.name.startswith("__") or len(node.name.strip("_")) < 4 or node.name.lower() in STOP_NAMES or node.name.startswith("test"):
+                        continue
+                    items.append({"kind": "function" if not isinstance(node, ast.ClassDef) else "class", "name": node.name,
+                                  "file": "%s:%d" % (rel, node.lineno), "doc": ast.get_docstring(node) or ""})
+    return items
+
+
+def find_duplicates(items, name_thr=0.6, doc_thr=0.5, max_items=4000):
+    """Cluster items whose names share tokens (token Jaccard >= name_thr) or whose docstrings are similar (>= doc_thr).
+
+    Also flags any mechanism word (install, update, ...) that appears in the names of items in three or more files."""
+    items = items[:max_items]
+    ntok = [set(split_name(i["name"])) - STOP_TOKENS for i in items]
+    dtok = [tokens(i["doc"]) if len(i["doc"].split()) >= 4 else set() for i in items]
+    parent = list(range(len(items)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    index = collections.defaultdict(set)
+    for n, (nt, dt) in enumerate(zip(ntok, dtok)):
+        for t in nt:
+            index[("n", t)].add(n)
+        for t in dt:
+            index[("d", t)].add(n)
+    pairs = set()
+    for key, members in index.items():
+        if len(members) > 60:
+            continue
+        ms = sorted(members)
+        for a in range(len(ms)):
+            for b in range(a + 1, len(ms)):
+                pairs.add((ms[a], ms[b]))
+    for i, j in pairs:
+        if (items[i]["kind"] == "file") != (items[j]["kind"] == "file"):
+            continue
+        nj, dj = jaccard(ntok[i], ntok[j]), jaccard(dtok[i], dtok[j])
+        if nj >= name_thr or dj >= doc_thr:
+            parent[find(i)] = find(j)
+    groups = collections.defaultdict(list)
+    for n in range(len(items)):
+        groups[find(n)].append(n)
+    clusters = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        clusters.append({"kinds": sorted({items[m]["kind"] for m in members}), "members": [{"name": items[m]["name"], "where": items[m]["file"]} for m in members],
+                         "reason": "similar names or docstrings"})
+    clusters.sort(key=lambda c: -len(c["members"]))
+    mech = []
+    for word in MECHANISMS:
+        hits = [(i["name"], i["file"]) for i in items if word in split_name(i["name"]) or word in i["name"].lower()]
+        if len({h[1].split(":")[0] for h in hits}) >= 3:
+            mech.append({"mechanism": word, "count": len(hits), "where": [h[1] for h in hits][:12]})
+    return {"clusters": clusters[:40], "mechanisms": mech}
+
+
+def py_module_names(rel):
+    mod = rel[:-3].replace("/", ".")
+    if mod.endswith(".__init__"):
+        mod = mod[: -len(".__init__")]
+    return mod
+
+
+def dead_python_files(repo, files):
+    """Python files that no other Python file imports, excluding entry points (main guard or shebang), tests and package markers."""
+    pyfiles = [f for f in files if f.endswith(".py")]
+    mod_of = {f: py_module_names(f) for f in pyfiles}
+    by_suffix = collections.defaultdict(set)
+    for f, m in mod_of.items():
+        parts = m.split(".")
+        for k in range(len(parts)):
+            by_suffix[".".join(parts[k:])].add(f)
+    imported, entry = set(), set()
+    for f in pyfiles:
+        text = read_text(os.path.join(repo, f)) or ""
+        if text.startswith("#!") or re.search(r"if\s+__name__\s*==\s*['\"]__main__['\"]", text):
+            entry.add(f)
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        pkg = mod_of[f].split(".")
+        if not f.endswith("__init__.py"):
+            pkg = pkg[:-1]
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                if node.level:
+                    keep = pkg[: len(pkg) - node.level + 1] if node.level > 1 else pkg
+                    base = ".".join(keep + ([node.module] if node.module else []))
+                names = [base] + ["%s.%s" % (base, a.name) if base else a.name for a in node.names]
+            for name in names:
+                parts = name.split(".")
+                for k in range(1, len(parts) + 1):
+                    for cand in by_suffix.get(".".join(parts[:k]), ()):
+                        if cand != f:
+                            imported.add(cand)
+                for cand in by_suffix.get(name, ()):
+                    if cand != f:
+                        imported.add(cand)
+    # a module imported only as a prefix of a longer dotted name still counts; names referenced by string in other files are not detected
+    dead = []
+    for f in pyfiles:
+        base = os.path.basename(f)
+        if f in imported or f in entry or base in ("__init__.py", "conftest.py", "setup.py", "__main__.py") or is_test(f):
+            continue
+        dead.append({"file": f, "lines": count_lines(read_text(os.path.join(repo, f)) or "")})
+    dead.sort(key=lambda d: -d["lines"])
+    return dead
+
+
+SHELL_FN = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w:-]*)\s*\(\)\s*\{")
+BRACE_FN = re.compile(r"^\s*(?:export\s+|public\s+|private\s+|static\s+|async\s+|pub\s+)*(?:function\*?|func|fn|def)\s+(?:\([^)]*\)\s*)?([A-Za-z_$][\w$]*)")
+
+
+def brace_functions(text, is_shell):
+    out, lines = [], text.splitlines()
+    n = 0
+    while n < len(lines):
+        m = (SHELL_FN if is_shell else BRACE_FN).match(lines[n])
+        if not m:
+            n += 1
+            continue
+        depth, seen, k = 0, False, n
+        while k < len(lines):
+            depth += lines[k].count("{") - lines[k].count("}")
+            seen = seen or "{" in lines[k]
+            if seen and depth <= 0:
+                break
+            k += 1
+        if seen:
+            out.append((m.group(1), n + 1, k - n + 1))
+        n = k + 1 if seen else n + 1
+    return out
+
+
+def largest_functions(repo, files, top=10):
+    found = []
+    for rel in files:
+        text = read_text(os.path.join(repo, rel))
+        if text is None or not is_code(rel, text) or is_test(rel):
+            continue
+        ext = os.path.splitext(rel)[1].lower()
+        if ext == ".py" or (ext == "" and "python" in text.split("\n", 1)[0]):
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    found.append({"name": node.name, "file": rel, "line": node.lineno, "lines": node.end_lineno - node.lineno + 1})
+        elif ext in BRACE_EXT or ext in (".sh", ".bash") or (ext == "" and "sh" in text.split("\n", 1)[0]):
+            for name, line, n in brace_functions(text, ext not in BRACE_EXT):
+                found.append({"name": name, "file": rel, "line": line, "lines": n})
+    found.sort(key=lambda f: -f["lines"])
+    return found[:top]
+
+
+def compute_metrics(repo):
+    repo = os.path.abspath(repo)
+    files = list_files(repo)
+    loc, code, tests = loc_by_dir(repo, files)
+    return {
+        "repo": os.path.basename(repo),
+        "generated": datetime.date.today().isoformat(),
+        "files": len(files),
+        "loc_by_top_dir": loc,
+        "loc_code": code,
+        "loc_tests": tests,
+        "test_to_code_ratio": round(tests / code, 3) if code else 0.0,
+        "history": history(repo),
+        "duplicates": find_duplicates(collect_items(repo, files)),
+        "dead_python_candidates": dead_python_files(repo, files),
+        "largest_functions": largest_functions(repo, files),
+    }
+
+
+def render_summary(m, limit=8):
+    L = ["# freshlook metrics: %s" % m["repo"], "", "Generated %s. Files: %d. Code lines: %d. Test lines: %d. Test-to-code ratio: %s." %
+         (m["generated"], m["files"], m["loc_code"], m["loc_tests"], m["test_to_code_ratio"]), "", "## Lines of code by top-level directory"]
+    for d, n in list(m["loc_by_top_dir"].items())[:15]:
+        L.append("- %s: %d" % (d, n))
+    h = m["history"]
+    L += ["", "## Complexity growth (git history)"]
+    if not h.get("weeks"):
+        L.append("- %s" % h.get("note", "no history"))
+    else:
+        L.append("- Weeks with commits: %d. Net lines: %d." % (len(h["weeks"]), h["net_lines"]))
+        L.append("- Lines added per week: %s (first half) then %s (second half)." % (h["avg_added_per_week_first_half"], h["avg_added_per_week_second_half"]))
+        L.append("- Commits per week: %s (first half) then %s (second half)." % (h["avg_commits_per_week_first_half"], h["avg_commits_per_week_second_half"]))
+        for wk, v in list(h["weeks"].items())[-limit:]:
+            L.append("  - %s: +%d -%d in %d commits" % (wk, v["added"], v["deleted"], v["commits"]))
+    d = m["duplicates"]
+    L += ["", "## Possible duplicate mechanisms (%d clusters)" % len(d["clusters"])]
+    for c in d["clusters"][:limit]:
+        L.append("- " + ", ".join("%s (%s)" % (x["name"], x["where"]) for x in c["members"][:6]))
+    for mech in d["mechanisms"][:limit]:
+        L.append("- mechanism '%s' appears %d times, e.g. %s" % (mech["mechanism"], mech["count"], ", ".join(mech["where"][:5])))
+    L += ["", "## Python dead-file candidates (%d)" % len(m["dead_python_candidates"])]
+    for x in m["dead_python_candidates"][:limit]:
+        L.append("- %s (%d lines)" % (x["file"], x["lines"]))
+    L += ["", "## Largest functions"]
+    for x in m["largest_functions"]:
+        L.append("- %s in %s:%d, %d lines" % (x["name"], x["file"], x["line"], x["lines"]))
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------- run
+
+def assemble_prompt(intent_text, metrics_md, template=None):
+    if template is None:
+        with open(PROMPT_FILE, encoding="utf-8") as f:
+            template = f.read()
+    return template.replace("{{INTENT}}", intent_text.strip()).replace("{{METRICS}}", metrics_md.strip())
+
+
+def build_command(model="", claude_bin=None):
+    """The exact argument vector for the headless audit. The prompt itself is sent on standard input."""
+    cmd = [claude_bin or os.environ.get("FRESHLOOK_CLAUDE", "claude"), "-p", "--output-format", "text", "--no-session-persistence",
+           "--setting-sources", "user", "--strict-mcp-config", "--disable-slash-commands",
+           "--allowedTools", ",".join(ALLOWED_TOOLS), "--disallowedTools", ",".join(DENIED_TOOLS)]
+    if model:
+        cmd += ["--model", model]
+    return cmd
+
+
+def make_readonly_copy(repo, dest):
+    """Export the committed tree (or a plain copy when not a git repository), drop instruction and hook files, then make it read-only."""
+    os.makedirs(dest)
+    if is_git(repo):
+        arc = subprocess.run(["git", "-C", repo, "archive", "HEAD"], capture_output=True, timeout=300)
+        if arc.returncode:
+            raise RuntimeError("git archive failed: " + arc.stderr.decode("utf-8", "replace"))
+        subprocess.run(["tar", "-x", "-C", dest], input=arc.stdout, check=True, timeout=300)
+    else:
+        shutil.copytree(repo, dest, dirs_exist_ok=True, ignore=shutil.ignore_patterns(*SKIP_DIRS))
+    for d, dirs, fs in os.walk(dest, topdown=True):
+        for name in list(dirs) + list(fs):
+            if name in STRIP_NAMES:
+                p = os.path.join(d, name)
+                shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
+                if name in dirs:
+                    dirs.remove(name)
+    for d, dirs, fs in os.walk(dest):
+        for name in fs:
+            p = os.path.join(d, name)
+            if not os.path.islink(p):
+                os.chmod(p, stat.S_IMODE(os.stat(p).st_mode) & ~0o222)
+    for d, dirs, fs in os.walk(dest, topdown=False):
+        os.chmod(d, 0o555)
+
+
+def remove_tree(path):
+    for d, dirs, fs in os.walk(path):
+        os.chmod(d, 0o755)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def cmd_metrics(args):
+    if not os.path.isdir(args.repo):
+        print("freshlook: not a directory: %s" % args.repo, file=sys.stderr)
+        return 2
+    m = compute_metrics(args.repo)
+    os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(m, f, indent=2)
+    md = render_summary(m)
+    with open(os.path.join(args.out, "metrics.md"), "w", encoding="utf-8") as f:
+        f.write(md)
+    print(md)
+    return 0
+
+
+def report_footer(m):
+    h = m["history"]
+    keys = {"loc_code": m["loc_code"], "loc_tests": m["loc_tests"], "test_to_code_ratio": m["test_to_code_ratio"],
+            "duplicate_clusters": len(m["duplicates"]["clusters"]), "dead_python_candidates": len(m["dead_python_candidates"]),
+            "largest_function_lines": m["largest_functions"][0]["lines"] if m["largest_functions"] else 0,
+            "avg_added_per_week_second_half": h.get("avg_added_per_week_second_half", 0), "files": m["files"]}
+    return "<!-- freshlook-metrics: %s -->" % json.dumps(keys, sort_keys=True)
+
+
+def cmd_run(args):
+    if not os.path.isdir(args.repo):
+        print("freshlook: not a directory: %s" % args.repo, file=sys.stderr)
+        return 2
+    if not os.path.isfile(args.intent):
+        print("freshlook: intent file not found: %s" % args.intent, file=sys.stderr)
+        return 2
+    cmd = build_command(args.model)
+    if args.dry_run:
+        print("cwd: <read-only copy of %s, exported to a temp directory>" % os.path.abspath(args.repo))
+        print("env: CLAUDE_CONFIG_DIR=%s" % (os.path.abspath(args.config_dir) if args.config_dir else "<fresh empty temp directory>"))
+        print("stdin: <audit prompt from %s with the intent file and metrics summary filled in>" % PROMPT_FILE)
+        print("command: " + " ".join(shlex.quote(c) for c in cmd))
+        return 0
+    with open(args.intent, encoding="utf-8") as f:
+        intent = f.read()
+    m = compute_metrics(args.repo)
+    os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(m, f, indent=2)
+    md = render_summary(m)
+    with open(os.path.join(args.out, "metrics.md"), "w", encoding="utf-8") as f:
+        f.write(md)
+    prompt = assemble_prompt(intent, md)
+    work = tempfile.mkdtemp(prefix="freshlook-")
+    try:
+        src = os.path.join(work, "src")
+        make_readonly_copy(os.path.abspath(args.repo), src)
+        cfg = os.path.abspath(args.config_dir) if args.config_dir else os.path.join(work, "claude-config")
+        os.makedirs(cfg, exist_ok=True)
+        env = dict(os.environ)
+        env["CLAUDE_CONFIG_DIR"] = cfg
+        env["DISABLE_TELEMETRY"] = "1"
+        try:
+            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=src, env=env, timeout=args.timeout)
+        except FileNotFoundError:
+            print("freshlook: claude executable not found (set FRESHLOOK_CLAUDE)", file=sys.stderr)
+            return 3
+        except subprocess.TimeoutExpired:
+            print("freshlook: audit timed out after %ds" % args.timeout, file=sys.stderr)
+            return 3
+        if r.returncode or not r.stdout.strip():
+            print("freshlook: claude failed (exit %d): %s" % (r.returncode, (r.stderr or r.stdout).strip()[:800]), file=sys.stderr)
+            return 3
+    finally:
+        remove_tree(work)
+    path = os.path.join(args.out, "report-%s.md" % datetime.date.today().isoformat())
+    head = "# freshlook report: %s\n\nDate: %s. Model: %s.\n\n" % (m["repo"], m["generated"], args.model or "default")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(head + r.stdout.strip() + "\n\n" + report_footer(m) + "\n")
+    print(path)
+    return 0
+
+
+# ---------------------------------------------------------------- diff
+
+FOOTER = re.compile(r"<!-- freshlook-metrics: (\{.*?\}) -->")
+LOWER_IS_BETTER = {"loc_code", "duplicate_clusters", "dead_python_candidates", "largest_function_lines", "avg_added_per_week_second_half", "files"}
+HIGHER_IS_BETTER = {"test_to_code_ratio", "loc_tests"}
+
+
+def parse_report(text):
+    footer = FOOTER.search(text)
+    metrics = json.loads(footer.group(1)) if footer else {}
+    sections, cur = collections.OrderedDict(), None
+    for line in text.splitlines():
+        m = re.match(r"##\s+(\d)\.", line)
+        if m:
+            cur = m.group(1)
+            sections[cur] = []
+        elif cur and re.match(r"\s*(\d+[.)]|[-*])\s+\S", line):
+            sections[cur].append(re.sub(r"^\s*(\d+[.)]|[-*])\s+", "", line).strip())
+    return metrics, sections
+
+
+def same_item(a, b, thr):
+    return a.lower() == b.lower() or jaccard(tokens(a), tokens(b)) >= thr
+
+
+def diff_reports(old_text, new_text, match_thr=0.5):
+    om, os_ = parse_report(old_text)
+    nm, ns = parse_report(new_text)
+    simpler, worse, same = [], [], []
+    for k in sorted(set(om) & set(nm)):
+        a, b = om[k], nm[k]
+        if a == b:
+            same.append("%s unchanged at %s" % (k, b))
+            continue
+        line = "%s: %s -> %s" % (k, a, b)
+        if (k in LOWER_IS_BETTER and b < a) or (k in HIGHER_IS_BETTER and b > a):
+            simpler.append(line)
+        elif k in LOWER_IS_BETTER or k in HIGHER_IS_BETTER:
+            worse.append(line)
+        else:
+            same.append(line)
+    resolved, added = [], []
+    for sec in ("2", "3", "5"):
+        olds, news = os_.get(sec, []), ns.get(sec, [])
+        for o in olds:
+            if not any(same_item(o, n, match_thr) for n in news):
+                resolved.append((sec, o))
+        for n in news:
+            if not any(same_item(o, n, match_thr) for o in olds):
+                added.append((sec, n))
+    return {"simpler": simpler, "worse": worse, "unchanged": same, "resolved": resolved, "new": added}
+
+
+def cmd_diff(args):
+    texts = []
+    for p in (args.old, args.new):
+        try:
+            with open(p, encoding="utf-8") as f:
+                texts.append(f.read())
+        except OSError as e:
+            print("freshlook: cannot read %s: %s" % (p, e), file=sys.stderr)
+            return 2
+    d = diff_reports(*texts)
+    print("# freshlook diff: %s -> %s\n" % (args.old, args.new))
+    print("## Got simpler")
+    for x in d["simpler"]:
+        print("- metric %s" % x)
+    for sec, x in d["resolved"]:
+        print("- gone from section %s: %s" % (sec, x))
+    print("\n## Got worse")
+    for x in d["worse"]:
+        print("- metric %s" % x)
+    for sec, x in d["new"]:
+        print("- new in section %s: %s" % (sec, x))
+    if d["unchanged"]:
+        print("\n## Unchanged or neutral")
+        for x in d["unchanged"]:
+            print("- %s" % x)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="freshlook", description="Fresh, independent audit aimed at stopping complexity growth.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("metrics", help="mechanical metrics, no tokens")
+    p.add_argument("repo")
+    p.add_argument("--out", default="freshlook")
+    p.set_defaults(fn=cmd_metrics)
+    p = sub.add_parser("run", help="headless audit with claude -p")
+    p.add_argument("repo")
+    p.add_argument("--intent", required=True)
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--out", default="freshlook")
+    p.add_argument("--config-dir", default=os.environ.get("FRESHLOOK_CONFIG_DIR", ""), help="persistent clean config dir you logged in to once (default: fresh temp dir)")
+    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--dry-run", action="store_true", help="print the exact command, call nothing")
+    p.set_defaults(fn=cmd_run)
+    p = sub.add_parser("diff", help="compare two reports")
+    p.add_argument("old")
+    p.add_argument("new")
+    p.set_defaults(fn=cmd_diff)
+    args = ap.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+freshlook/
+.ruff_cache/
