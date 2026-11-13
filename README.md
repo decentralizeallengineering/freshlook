@@ -11,9 +11,11 @@ confined to a read-only copy of the committed tree; there is no shell.
 
 ## Install
 
+    git clone https://github.com/decentralizeallengineering/freshlook && mkdir -p ~/.local/bin && ln -s "$PWD/freshlook/bin/freshlook" ~/.local/bin/freshlook
+
 Python 3.9+, `git`, and for `run` the `claude` command-line tool (verified with 2.1.311; `--restricted`, `--safe-mode`, `--max-turns` and
-`--max-budget-usd` must exist in your version). Copy `bin/freshlook` onto your `PATH` and keep the `prompts/` directory next to `bin/`
-(or set `FRESHLOOK_PROMPT` to another prompt file). No other dependencies.
+`--max-budget-usd` must exist in your version). The line above links `bin/freshlook` onto your `PATH`; the link finds `prompts/`
+in the checkout (or set `FRESHLOOK_PROMPT` to another prompt file). No other dependencies.
 
 ## Configure
 

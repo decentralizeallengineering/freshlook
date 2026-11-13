@@ -14,7 +14,7 @@ inside the clean config directory. The default output directory is ./freshlook.
 Exit codes: 2 usage error, 3 audit run failed, 4 independence check failed, 130 interrupted."""
 import argparse, ast, collections, datetime, hashlib, io, json, os, re, shlex, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 PROMPT_FILE = os.environ.get("FRESHLOOK_PROMPT") or os.path.join(HERE, "prompts", "audit.md")
 DEFAULT_MODEL = os.environ.get("FRESHLOOK_MODEL", "")
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache", ".ruff_cache", ".pytest_cache", "dist", "build", "freshlook"}

@@ -444,5 +444,20 @@ class Run(unittest.TestCase):
             os.remove(self.log + ".pids")
 
 
+class Link(unittest.TestCase):
+    def test_symlinked_bin_finds_prompts(self):
+        with tempfile.TemporaryDirectory() as d:
+            make_fixture(d)
+            write(d, "intent.md", "A tiny app.\n")
+            os.makedirs(os.path.join(d, "bin"))
+            link = os.path.join(d, "bin", "freshlook")
+            os.symlink(BIN, link)
+            env = {k: v for k, v in os.environ.items() if k != "FRESHLOOK_PROMPT"}
+            r = subprocess.run([sys.executable, link, "run", d, "--intent", os.path.join(d, "intent.md"), "--dry-run"],
+                               check=False, capture_output=True, text=True, timeout=60, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("audit prompt from %s " % os.path.join(ROOT, "prompts", "audit.md"), r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
